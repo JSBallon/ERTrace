@@ -12,6 +12,10 @@ build/
 .env
 *.env
 
+# Agents
+.clinerules/
+.memorybank/
+
 # HuggingFace Model Cache
 ~/.cache/huggingface/
 .cache/
