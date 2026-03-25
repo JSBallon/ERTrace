@@ -15,6 +15,7 @@ build/
 # Agents
 .clinerules/
 .memorybank/
+opencode.json
 
 # HuggingFace Model Cache
 ~/.cache/huggingface/
