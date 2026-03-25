@@ -1,0 +1,11 @@
+sentence-transformers>=2.7.0
+faiss-cpu
+rapidfuzz>=3.0.0
+cleanco
+pydantic>=2.0.0
+pandas>=2.0.0
+faker>=24.0.0
+jsonlines
+streamlit>=1.35.0
+numpy
+pytest
