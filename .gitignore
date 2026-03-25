@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+*.env
+
+# HuggingFace Model Cache
+~/.cache/huggingface/
+.cache/
+
+# Outputs und Logs
+outputs/
+logs/audit/
+!outputs/.gitkeep
+!logs/audit/.gitkeep
+
+# Testdaten
+data/
+*.csv
+*.json
+!config/*.yaml
+
+# IDE
+.vscode/
+.idea/
+*.swp
