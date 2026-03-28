@@ -1,0 +1,40 @@
+# Config version: v1.0-default
+# Created: March 2026
+# Rationale: Initial defaults — before gold standard calibration
+
+metadata:
+  threshold_config_version: "v1.0-default"
+  weights_config_version: "v1.0-default"
+  legal_form_config_version: "v1.0-default"
+  created_at: "2026-03-25"
+  rationale: "Initial defaults — before gold standard calibration"
+
+embedding:
+  model: "Vsevolod/company-names-similarity-sentence-transformer"
+  alternatives:
+    - "paraphrase-multilingual-MiniLM-L12-v2"
+    - "deutsche-telekom/gbert-large-paraphrase-cosine"
+    - "all-MiniLM-L6-v2"
+
+faiss:
+  top_k: 5
+
+thresholds:
+  auto_match_threshold: 0.92
+  review_lower_threshold: 0.70
+
+weights:
+  w_embedding: 0.50
+  w_jaro_winkler: 0.20
+  w_token_sort: 0.20
+  w_legal_form: 0.10
+  # Constraint: sum must equal 1.0
+
+legal_form:
+  identical_score: 1.0
+  related_score: 0.5
+  conflict_score: 0.0
+  unknown_score: 0.5
+
+monitoring:
+  review_quote_warning_threshold: 0.30
