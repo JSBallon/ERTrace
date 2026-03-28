@@ -4,20 +4,30 @@ DAL — LegalFormExtractor
 Rule-based extraction of legal form strings from raw company names,
 plus classification of the relation between two legal forms.
 
-Extraction uses an ordered regex scan — compound forms (e.g. "GmbH & Co. KG")
-are matched BEFORE their component forms ("GmbH") to prevent misclassification.
-See ADR-006 for design rationale.
+Uses BOTH cleanco sources as complementary dimensions (see ADR-006):
+  - typesources()    → matched_term + legal_type (e.g. "Limited", "Corporation")
+  - countrysources() → jurisdiction set (e.g. frozenset({"Germany", "Switzerland"}))
 
-Pipeline position: runs BEFORE normalization (normalizer strips the legal form
-after this module has already captured it as a structured field).
+Relation classification uses strict AND — both dimensions must agree:
+  - identical : same matched term
+  - related   : same legal_type AND overlapping country sets
+  - conflict  : any mismatch on either dimension
+  - unknown   : term not recognized on one or both sides
 
-Public API:
-  extractor = LegalFormExtractor()
-  legal_form_str, class_id = extractor.extract("Bayerische Landesbank GmbH & Co. KG")
-  # → ("GmbH & Co. KG", "DE_GMBH_COKG")
+Rationale for strict AND:
+  GmbH ↔ AG  : Limited vs Corporation (type differs) → conflict
+               despite sharing Germany (country overlaps)
+  GmbH ↔ Ltd.: Limited vs Limited (type same) → NOT related
+               because DE vs UK (no country overlap) → conflict
 
-  relation = extractor.classify_relation("DE_GMBH", "DE_AG")
-  # → "related"
+Accepted gaps (Option A, agreed 2026-03-27):
+  "UG (haftungsbeschränkt)", "Aktiengesellschaft" not in cleanco
+  → (None, None, frozenset()) → "unknown" → legal_form_score = 0.5
+
+See ADR-006 for full design rationale and revision history.
+
+Pipeline position: runs BEFORE normalization. The normalizer strips the legal
+form after this module has already captured it as a structured field.
 
 No Streamlit imports. No BLL imports. No external API calls.
 """
@@ -25,85 +35,29 @@ No Streamlit imports. No BLL imports. No external API calls.
 import re
 from typing import Literal
 
+from cleanco.classify import typesources, countrysources
+
 
 # ---------------------------------------------------------------------------
-# Legal form pattern list — ORDER IS CRITICAL (see ADR-006)
-# Compound / longer forms MUST precede their component forms.
-# First match wins.
+# Module-level: load cleanco sources once at import time
+#
+# typesources()    → list of (legal_type, term) sorted by term length desc
+# countrysources() → list of (country, term)  sorted by term length desc
 # ---------------------------------------------------------------------------
 
-_RAW_PATTERNS: list[tuple[str, str]] = [
-    # --- DE: compound forms first ---
-    (r"\bGmbH\s*&\s*Co\.?\s*KG\b",                             "DE_GMBH_COKG"),
-    (r"\bUG\s*\(haftungsbeschr[äa]nkt\)\b",                    "DE_UG"),
-    # --- DE: long-form names before abbreviations ---
-    (r"\bGesellschaft\s+mit\s+beschr[äa]nkter\s+Haftung\b",    "DE_GMBH"),
-    (r"\bGesellschaft\s+mbH\b",                                 "DE_GMBH"),
-    (r"\bG\.m\.b\.H\.\b",                                       "DE_GMBH"),
-    (r"\bAktiengesellschaft\b",                                 "DE_AG"),
-    (r"\bKommanditgesellschaft\b",                              "DE_KG"),
-    # --- DE: abbreviations ---
-    (r"\bGmbH\b",                                               "DE_GMBH"),
-    (r"\bAG\b",                                                 "DE_AG"),
-    (r"\bKG\b",                                                 "DE_KG"),
-    (r"\bUG\b",                                                 "DE_UG"),
-    (r"\bSE\b",                                                 "DE_SE"),
-    (r"\beG\b",                                                 "DE_EG"),
-    # --- UK/US: long forms before abbreviations ---
-    (r"\bLimited\b",                                            "UK_LTD"),
-    (r"\bCorporation\b",                                        "US_CORP"),
-    (r"\bIncorporated\b",                                       "US_CORP"),
-    (r"\bL\.L\.C\.\b",                                         "US_CORP"),
-    (r"\bLLC\b",                                               "US_CORP"),
-    (r"\bInc\.\b",                                             "US_CORP"),
-    (r"\bInc\b",                                               "US_CORP"),
-    (r"\bCorp\.\b",                                            "US_CORP"),
-    (r"\bCorp\b",                                              "US_CORP"),
-    (r"\bLtd\.\b",                                             "UK_LTD"),
-    (r"\bLtd\b",                                               "UK_LTD"),
-    (r"\bPlc\b",                                               "UK_PLC"),
-    (r"\bPLC\b",                                               "UK_PLC"),
-    # --- EU: long forms before abbreviations ---
-    (r"\bSoci[ée]t[ée]\s+Anonyme\b",                           "FR_SA"),
-    (r"\bNaamloze\s+Vennootschap\b",                           "NL_NV"),
-    (r"\bBesloten\s+Vennootschap\b",                           "NL_BV"),
-    (r"\bSoci[ée]t[ée]\s+[àa]\s+Responsabilit[ée]\s+Limit[ée]e\b", "FR_SARL"),
-    # --- EU: abbreviations (placed AFTER longer EU forms) ---
-    (r"\bS\.A\.R\.L\.\b",                                      "FR_SARL"),
-    (r"\bSARL\b",                                              "FR_SARL"),
-    (r"\bS\.A\.\b",                                            "FR_SA"),
-    # SA must come after S.A. and SARL to avoid partial matches
-    (r"\bSA\b",                                                "FR_SA"),
-    (r"\bN\.V\.\b",                                            "NL_NV"),
-    (r"\bNV\b",                                                "NL_NV"),
-    (r"\bB\.V\.\b",                                            "NL_BV"),
-    (r"\bBV\b",                                                "NL_BV"),
-    (r"\bS\.p\.A\.\b",                                         "IT_SPA"),
-    (r"\bSpA\b",                                               "IT_SPA"),
-    (r"\bS\.L\.\b",                                            "ES_SL"),
-]
+_TSRC: list[tuple[str, str]] = typesources()
+_CSRC: list[tuple[str, str]] = countrysources()
 
-# Pre-compile all patterns for performance
-_COMPILED_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (re.compile(raw, re.IGNORECASE), class_id)
-    for raw, class_id in _RAW_PATTERNS
-]
+# Pre-build term → frozenset[country] for O(1) country lookup
+_TERM_TO_COUNTRIES: dict[str, frozenset[str]] = {}
+for _country, _term in _CSRC:
+    _TERM_TO_COUNTRIES[_term] = _TERM_TO_COUNTRIES.get(_term, frozenset()) | {_country}
 
-# ---------------------------------------------------------------------------
-# Related groups — same group = "related", different groups = "conflict"
-# ---------------------------------------------------------------------------
-
-_RELATED_GROUPS: list[frozenset[str]] = [
-    frozenset({"DE_GMBH", "DE_AG", "DE_KG", "DE_GMBH_COKG", "DE_UG", "DE_SE", "DE_EG"}),
-    frozenset({"UK_LTD", "UK_PLC", "US_CORP"}),
-    frozenset({"FR_SA", "FR_SARL", "NL_NV", "NL_BV", "IT_SPA", "ES_SL"}),
-]
-
-# Build a fast class_id → group_index lookup
-_CLASS_TO_GROUP: dict[str, int] = {}
-for _idx, _group in enumerate(_RELATED_GROUPS):
-    for _cls in _group:
-        _CLASS_TO_GROUP[_cls] = _idx
+# Pre-build term → legal_type from typesources (first/longest match wins)
+_TERM_TO_TYPE: dict[str, str] = {}
+for _legal_type, _term in _TSRC:
+    if _term not in _TERM_TO_TYPE:
+        _TERM_TO_TYPE[_term] = _legal_type
 
 
 # ---------------------------------------------------------------------------
@@ -112,87 +66,132 @@ for _idx, _group in enumerate(_RELATED_GROUPS):
 
 class LegalFormExtractor:
     """
-    Rule-based legal form extractor and relation classifier.
+    Combined typesource + countrysource legal form extractor and classifier.
 
-    Extraction: ordered regex scan, compound/specific forms first (ADR-006).
-    Classification: lookup table — identical / related / conflict / unknown.
+    Extraction : scans typesources() (longest-first) for matched_term and
+                 legal_type; looks up countries from countrysources() index.
+    Classification : strict AND — same legal_type AND overlapping countries
+                     required for "related". Any mismatch → "conflict".
     """
 
-    def extract(self, name: str) -> tuple[str | None, str | None]:
+    def extract(self, name: str) -> tuple[str | None, str | None, frozenset[str]]:
         """
-        Extract the legal form string and its class ID from a company name.
+        Extract the legal form term, its type, and its jurisdiction set.
+
+        Scans typesources() first (pre-sorted longest-first by cleanco).
+        Falls back to countrysources() for terms present there but not in
+        typesources() (rare — covers edge cases like some jurisdiction-only terms).
 
         Args:
             name: Raw company name string.
 
         Returns:
-            Tuple of (legal_form_string, class_id).
-            Both are None if no legal form is recognized.
+            Tuple of (matched_term, legal_type, countries).
+            - matched_term : lowercase term string, e.g. "gmbh", "gmbh & co. kg"
+            - legal_type   : cleanco type label, e.g. "Limited", "Corporation"
+                             None if term found only in countrysources
+            - countries    : frozenset of country names, e.g. frozenset({"Germany"})
+                             frozenset() if term not in countrysources
+
+            All three are (None, None, frozenset()) if no legal form recognized.
 
         Examples:
-            "Bayerische Landesbank GmbH & Co. KG" → ("GmbH & Co. KG", "DE_GMBH_COKG")
-            "Deutsche Bank AG"                    → ("AG", "DE_AG")
-            "Bridgewater Associates"              → (None, None)
+            "Bayerische Landesbank GmbH & Co. KG"
+                → ("gmbh & co. kg", "Limited Partnership", frozenset({"Germany"}))
+            "Deutsche Bank AG"
+                → ("ag", "Corporation", frozenset({"Austria", "Germany"}))
+            "ACME Ltd."
+                → ("ltd.", "Limited", frozenset({"United Kingdom", ...}))
+            "No legal form here"
+                → (None, None, frozenset())
         """
         if not name or not name.strip():
-            return None, None
+            return None, None, frozenset()
 
-        for pattern, class_id in _COMPILED_PATTERNS:
-            match = pattern.search(name)
-            if match:
-                return match.group(0).strip(), class_id
+        name_lower = name.lower()
 
-        return None, None
+        # Primary scan: typesources (longest-first, covers most legal forms)
+        for legal_type, term in _TSRC:
+            pattern = r"(?<![a-z])" + re.escape(term) + r"(?![a-z])"
+            if re.search(pattern, name_lower):
+                countries = _TERM_TO_COUNTRIES.get(term, frozenset())
+                return term, legal_type, countries
+
+        # Fallback scan: countrysources (catches terms not in typesources)
+        for _country, term in _CSRC:
+            pattern = r"(?<![a-z])" + re.escape(term) + r"(?![a-z])"
+            if re.search(pattern, name_lower):
+                countries = _TERM_TO_COUNTRIES.get(term, frozenset())
+                return term, None, countries
+
+        return None, None, frozenset()
 
     def classify_relation(
         self,
-        class_a: str | None,
-        class_b: str | None,
+        type_a: str | None,
+        countries_a: frozenset[str],
+        type_b: str | None,
+        countries_b: frozenset[str],
     ) -> Literal["identical", "related", "conflict", "unknown"]:
         """
-        Classify the relation between two legal form class IDs.
+        Classify the relation between two legal forms using strict AND logic.
 
-        Rules:
-          - Either class is None / unrecognized → "unknown"
-          - Same class ID                       → "identical"
-          - Same related group                  → "related"
-          - Different groups                    → "conflict"
+        Both legal_type AND country overlap must agree simultaneously.
+        A mismatch on either dimension → "conflict".
+
+        Rules (applied in order):
+          1. type_a is None OR type_b is None → "unknown"
+          2. type_a == type_b AND countries_a ∩ countries_b non-empty → "related"
+          3. everything else → "conflict"
+
+        Note: "identical" is determined at the term level in extract_and_classify(),
+        not here — this method receives types and countries only.
 
         Args:
-            class_a: Legal form class ID from source A (e.g. "DE_GMBH").
-            class_b: Legal form class ID from source B (e.g. "DE_AG").
+            type_a     : legal_type from extract() for source A.
+            countries_a: frozenset of countries from extract() for source A.
+            type_b     : legal_type from extract() for source B.
+            countries_b: frozenset of countries from extract() for source B.
 
         Returns:
-            One of: "identical", "related", "conflict", "unknown".
+            One of: "related", "conflict", "unknown".
 
         Examples:
-            ("DE_GMBH", "DE_GMBH") → "identical"
-            ("DE_GMBH", "DE_AG")   → "related"
-            ("DE_GMBH", "UK_LTD")  → "conflict"
-            (None,      "DE_AG")   → "unknown"
+            ("Limited", {"Germany"}, "Limited", {"Germany"})
+                → "related"   (same type, shared Germany)
+            ("Limited", {"Germany"}, "Corporation", {"Germany"})
+                → "conflict"  (type differs despite shared country)
+            ("Limited", {"Germany"}, "Limited", {"United Kingdom"})
+                → "conflict"  (type same but no shared country)
+            (None, frozenset(), "Corporation", {"Germany"})
+                → "unknown"
         """
-        # Unknown if either side is missing or unrecognized
-        if not class_a or not class_b:
-            return "unknown"
-        if class_a not in _CLASS_TO_GROUP or class_b not in _CLASS_TO_GROUP:
+        if type_a is None or type_b is None:
             return "unknown"
 
-        # Identical
-        if class_a == class_b:
-            return "identical"
-
-        # Related (same group)
-        if _CLASS_TO_GROUP[class_a] == _CLASS_TO_GROUP[class_b]:
+        if type_a == type_b and bool(countries_a & countries_b):
             return "related"
 
-        # Conflict (different groups)
         return "conflict"
 
     def extract_and_classify(
-        self, name_a: str, name_b: str
-    ) -> tuple[str | None, str | None, str | None, str | None, Literal["identical", "related", "conflict", "unknown"]]:
+        self,
+        name_a: str,
+        name_b: str,
+    ) -> tuple[
+        str | None,
+        str | None,
+        frozenset[str],
+        str | None,
+        str | None,
+        frozenset[str],
+        Literal["identical", "related", "conflict", "unknown"],
+    ]:
         """
         Convenience method: extract from both names and classify the relation.
+
+        Handles "identical" detection at the term level before delegating
+        to classify_relation() for the type+country AND logic.
 
         Args:
             name_a: Raw company name from source A.
@@ -200,9 +199,14 @@ class LegalFormExtractor:
 
         Returns:
             Tuple of:
-              (lf_string_a, class_id_a, lf_string_b, class_id_b, relation)
+              (term_a, type_a, countries_a, term_b, type_b, countries_b, relation)
         """
-        lf_a, cls_a = self.extract(name_a)
-        lf_b, cls_b = self.extract(name_b)
-        relation = self.classify_relation(cls_a, cls_b)
-        return lf_a, cls_a, lf_b, cls_b, relation
+        term_a, type_a, countries_a = self.extract(name_a)
+        term_b, type_b, countries_b = self.extract(name_b)
+
+        # identical: exact same term (before type/country comparison)
+        if term_a is not None and term_a == term_b:
+            return term_a, type_a, countries_a, term_b, type_b, countries_b, "identical"
+
+        relation = self.classify_relation(type_a, countries_a, type_b, countries_b)
+        return term_a, type_a, countries_a, term_b, type_b, countries_b, relation
