@@ -7,8 +7,8 @@ Serializes pipeline results to disk:
                              sorted ascending by review_priority (P1 first)
   - audit_<run_id>.jsonl   : append-only JSONL audit events (delegated to AuditLogger)
 
-frozenset fields (countries from LegalFormExtractor) are converted to sorted lists
-via make_serializable() from dal/utils.py before JSON serialization.
+All fields in MatchResult are JSON-serializable via Pydantic model_dump() directly —
+no pre-processor needed (frozenset removed from domain model, see ADR-006 refactor).
 
 See ADR-008 for design rationale.
 
@@ -16,11 +16,11 @@ No Streamlit imports. No BLL imports. No external API calls.
 """
 
 import json
+import jsonlines
 from datetime import datetime, timezone
 from pathlib import Path
 
 from bll.schemas import MatchResult
-from dal.utils import make_serializable
 
 
 class OutputWriter:
@@ -67,7 +67,7 @@ class OutputWriter:
             "run_id": run_id,
             "generated_at": ts,
             "total_entries": len(results),
-            "results": [make_serializable(r.model_dump()) for r in results],
+            "results": [r.model_dump() for r in results],
         }
 
         path.write_text(
@@ -112,7 +112,7 @@ class OutputWriter:
             "generated_at": ts,
             "total_review_entries": len(review_entries),
             "sorted_by": "review_priority ascending (1=mandatory, 3=low-urgency)",
-            "entries": [make_serializable(r.model_dump()) for r in review_entries],
+            "entries": [r.model_dump() for r in review_entries],
         }
 
         path.write_text(
@@ -136,15 +136,11 @@ class OutputWriter:
             event : Dict representing the audit event. Must contain 'event_type'.
             run_id: Run identifier — used in the filename and injected into event.
         """
-        import jsonlines
-
         path = self.audit_dir / f"audit_{run_id}.jsonl"
 
         event_out = dict(event)
         event_out.setdefault("run_id", run_id)
-        event_out.setdefault(
-            "timestamp", datetime.now(timezone.utc).isoformat()
-        )
+        event_out.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
 
         with jsonlines.open(path, mode="a") as writer:
-            writer.write(make_serializable(event_out))
+            writer.write(event_out)

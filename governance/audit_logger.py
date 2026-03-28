@@ -12,8 +12,8 @@ Every event carries:
 Per-write open/close (mode='a') guarantees crash safety — events written
 before a crash are never lost. See ADR-009 for design rationale.
 
-frozenset fields are serialized via make_serializable() from dal/utils.py.
-See ADR-010 for the shared utility rationale.
+All fields are JSON-serializable via Pydantic model_dump() directly —
+no pre-processor needed (frozenset removed from domain model, see ADR-006 refactor).
 
 Event types:
   run_start          : full RunConfig at start of run
@@ -31,7 +31,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from bll.schemas import MatchResult, RunConfig, RunSummary
-from dal.utils import make_serializable
 
 
 class AuditLogger:
@@ -62,7 +61,7 @@ class AuditLogger:
         event["run_id"] = self.run_id
         event["timestamp"] = datetime.now(timezone.utc).isoformat()
         with jsonlines.open(self.path, mode="a") as writer:
-            writer.write(make_serializable(event))
+            writer.write(event)
 
     # ------------------------------------------------------------------
     # Public log methods

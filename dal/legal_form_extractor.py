@@ -6,7 +6,7 @@ plus classification of the relation between two legal forms.
 
 Uses BOTH cleanco sources as complementary dimensions (see ADR-006):
   - typesources()    → matched_term + legal_type (e.g. "Limited", "Corporation")
-  - countrysources() → jurisdiction set (e.g. frozenset({"Germany", "Switzerland"}))
+  - countrysources() → jurisdiction list (e.g. ["Germany", "Switzerland"])
 
 Relation classification uses strict AND — both dimensions must agree:
   - identical : same matched term
@@ -22,7 +22,7 @@ Rationale for strict AND:
 
 Accepted gaps (Option A, agreed 2026-03-27):
   "UG (haftungsbeschränkt)", "Aktiengesellschaft" not in cleanco
-  → (None, None, frozenset()) → "unknown" → legal_form_score = 0.5
+  → (None, None, []) → "unknown" → legal_form_score = 0.5
 
 See ADR-006 for full design rationale and revision history.
 
@@ -48,10 +48,16 @@ from cleanco.classify import typesources, countrysources
 _TSRC: list[tuple[str, str]] = typesources()
 _CSRC: list[tuple[str, str]] = countrysources()
 
-# Pre-build term → frozenset[country] for O(1) country lookup
-_TERM_TO_COUNTRIES: dict[str, frozenset[str]] = {}
+# Pre-build term → sorted list[country] for O(1) country lookup
+# Sorted at build time once — deterministic order, plain list, JSON-serializable
+_TERM_TO_COUNTRIES: dict[str, list[str]] = {}
 for _country, _term in _CSRC:
-    _TERM_TO_COUNTRIES[_term] = _TERM_TO_COUNTRIES.get(_term, frozenset()) | {_country}
+    if _term not in _TERM_TO_COUNTRIES:
+        _TERM_TO_COUNTRIES[_term] = []
+    if _country not in _TERM_TO_COUNTRIES[_term]:
+        _TERM_TO_COUNTRIES[_term].append(_country)
+for _term in _TERM_TO_COUNTRIES:
+    _TERM_TO_COUNTRIES[_term].sort()
 
 # Pre-build term → legal_type from typesources (first/longest match wins)
 _TERM_TO_TYPE: dict[str, str] = {}
@@ -74,9 +80,9 @@ class LegalFormExtractor:
                      required for "related". Any mismatch → "conflict".
     """
 
-    def extract(self, name: str) -> tuple[str | None, str | None, frozenset[str]]:
+    def extract(self, name: str) -> tuple[str | None, str | None, list[str]]:
         """
-        Extract the legal form term, its type, and its jurisdiction set.
+        Extract the legal form term, its type, and its jurisdiction list.
 
         Scans typesources() first (pre-sorted longest-first by cleanco).
         Falls back to countrysources() for terms present there but not in
@@ -90,23 +96,23 @@ class LegalFormExtractor:
             - matched_term : lowercase term string, e.g. "gmbh", "gmbh & co. kg"
             - legal_type   : cleanco type label, e.g. "Limited", "Corporation"
                              None if term found only in countrysources
-            - countries    : frozenset of country names, e.g. frozenset({"Germany"})
-                             frozenset() if term not in countrysources
+            - countries    : sorted list of country names, e.g. ["Austria", "Germany"]
+                             [] if term not in countrysources
 
-            All three are (None, None, frozenset()) if no legal form recognized.
+            All three are (None, None, []) if no legal form recognized.
 
         Examples:
             "Bayerische Landesbank GmbH & Co. KG"
-                → ("gmbh & co. kg", "Limited Partnership", frozenset({"Germany"}))
+                → ("gmbh & co. kg", "Limited Partnership", ["Germany"])
             "Deutsche Bank AG"
-                → ("ag", "Corporation", frozenset({"Austria", "Germany"}))
+                → ("ag", "Corporation", ["Austria", "Germany"])
             "ACME Ltd."
-                → ("ltd.", "Limited", frozenset({"United Kingdom", ...}))
+                → ("ltd.", "Limited", ["India", "Nigeria", ..., "United Kingdom", ...])
             "No legal form here"
-                → (None, None, frozenset())
+                → (None, None, [])
         """
         if not name or not name.strip():
-            return None, None, frozenset()
+            return None, None, []
 
         name_lower = name.lower()
 
@@ -114,24 +120,24 @@ class LegalFormExtractor:
         for legal_type, term in _TSRC:
             pattern = r"(?<![a-z])" + re.escape(term) + r"(?![a-z])"
             if re.search(pattern, name_lower):
-                countries = _TERM_TO_COUNTRIES.get(term, frozenset())
+                countries = list(_TERM_TO_COUNTRIES.get(term, []))
                 return term, legal_type, countries
 
         # Fallback scan: countrysources (catches terms not in typesources)
         for _country, term in _CSRC:
             pattern = r"(?<![a-z])" + re.escape(term) + r"(?![a-z])"
             if re.search(pattern, name_lower):
-                countries = _TERM_TO_COUNTRIES.get(term, frozenset())
+                countries = list(_TERM_TO_COUNTRIES.get(term, []))
                 return term, None, countries
 
-        return None, None, frozenset()
+        return None, None, []
 
     def classify_relation(
         self,
         type_a: str | None,
-        countries_a: frozenset[str],
+        countries_a: list[str],
         type_b: str | None,
-        countries_b: frozenset[str],
+        countries_b: list[str],
     ) -> Literal["identical", "related", "conflict", "unknown"]:
         """
         Classify the relation between two legal forms using strict AND logic.
@@ -149,27 +155,27 @@ class LegalFormExtractor:
 
         Args:
             type_a     : legal_type from extract() for source A.
-            countries_a: frozenset of countries from extract() for source A.
+            countries_a: sorted list of countries from extract() for source A.
             type_b     : legal_type from extract() for source B.
-            countries_b: frozenset of countries from extract() for source B.
+            countries_b: sorted list of countries from extract() for source B.
 
         Returns:
             One of: "related", "conflict", "unknown".
 
         Examples:
-            ("Limited", {"Germany"}, "Limited", {"Germany"})
+            ("Limited", ["Germany"], "Limited", ["Germany"])
                 → "related"   (same type, shared Germany)
-            ("Limited", {"Germany"}, "Corporation", {"Germany"})
+            ("Limited", ["Germany"], "Corporation", ["Germany"])
                 → "conflict"  (type differs despite shared country)
-            ("Limited", {"Germany"}, "Limited", {"United Kingdom"})
+            ("Limited", ["Germany"], "Limited", ["United Kingdom"])
                 → "conflict"  (type same but no shared country)
-            (None, frozenset(), "Corporation", {"Germany"})
+            (None, [], "Corporation", ["Germany"])
                 → "unknown"
         """
         if type_a is None or type_b is None:
             return "unknown"
 
-        if type_a == type_b and bool(countries_a & countries_b):
+        if type_a == type_b and bool(set(countries_a) & set(countries_b)):
             return "related"
 
         return "conflict"
@@ -181,10 +187,10 @@ class LegalFormExtractor:
     ) -> tuple[
         str | None,
         str | None,
-        frozenset[str],
+        list[str],
         str | None,
         str | None,
-        frozenset[str],
+        list[str],
         Literal["identical", "related", "conflict", "unknown"],
     ]:
         """
