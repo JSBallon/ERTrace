@@ -338,12 +338,12 @@ def run_entity_resolution(
     from dal.output_writer import OutputWriter
 
     # -----------------------------------------------------------------------
-    # Config
+    # Config — algorithm parameters only, no data paths (see ADR-M2-006)
     # -----------------------------------------------------------------------
-    config = load_run_config(config_path, source_a_path, source_b_path)
+    config = load_run_config(config_path)
 
     # -----------------------------------------------------------------------
-    # Load raw records
+    # Load raw records — InputLoader validates paths before they are recorded
     # -----------------------------------------------------------------------
     loader = InputLoader()
     raw_a = loader.load(source_a_path)
@@ -371,10 +371,16 @@ def run_entity_resolution(
 
     # -----------------------------------------------------------------------
     # Pipeline execution
+    # Paths passed to log_run_start only after InputLoader has validated them —
+    # the audit record captures confirmed, real file paths (see ADR-M2-006)
     # -----------------------------------------------------------------------
     ts_start    = datetime.now(timezone.utc).isoformat()
     audit_logger = AuditLogger(run_id=config.run_id)
-    audit_logger.log_run_start(config)
+    audit_logger.log_run_start(
+        config,
+        input_file_a=source_a_path,
+        input_file_b=source_b_path,
+    )
 
     pipeline = TGFRPipeline(config, audit_logger)
     results  = pipeline.run(records_a, records_b, progress_callback)

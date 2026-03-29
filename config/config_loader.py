@@ -29,16 +29,16 @@ from bll.schemas import (
 
 def load_run_config(
     config_path: str = "config/config.yaml",
-    source_a_path: str = "",
-    source_b_path: str = "",
 ) -> RunConfig:
     """
     Load the active versioned YAML config and construct a RunConfig.
 
+    Owns only algorithm configuration (model, FAISS, thresholds, weights, legal form).
+    Input file paths are NOT part of RunConfig — they are run-time data pointers
+    that belong on the audit event directly (see ADR-M2-006 refactor).
+
     Args:
-        config_path:   Path to config/config.yaml (contains active_version pointer).
-        source_a_path: Path to Source A input file — captured in RunConfig for audit.
-        source_b_path: Path to Source B input file — captured in RunConfig for audit.
+        config_path: Path to config/config.yaml (contains active_version pointer).
 
     Returns:
         Fully validated RunConfig ready for TGFRPipeline.
@@ -95,7 +95,5 @@ def load_run_config(
         threshold_config_version=meta["threshold_config_version"],
         weights_config_version=meta["weights_config_version"],
         legal_form_config_version=meta["legal_form_config_version"],
-        input_file_a=source_a_path,
-        input_file_b=source_b_path,
         timestamp=datetime.now(timezone.utc).isoformat(),
     )

@@ -59,8 +59,6 @@ def run_config(run_id):
         threshold_config_version="v1.0-default",
         weights_config_version="v1.0-default",
         legal_form_config_version="v1.0-default",
-        input_file_a="source_a.csv",
-        input_file_b="source_b.csv",
         timestamp="2026-03-28T00:00:00Z",
     )
 
