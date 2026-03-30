@@ -2,24 +2,29 @@
 BLL — TGFRPipeline
 
 TGFR (Transformer-Gather, Fuzzy-Reconsider) pipeline orchestrator.
-Wires all five BLL components (Tasks 1–5) into a complete entity resolution run.
+Wires all BLL components into a complete entity resolution run.
 
-Processing sequence (see ADR-M2-006):
+Processing sequence (ADR-M2-006, updated M3 per ADR-M3-003):
   Stage 1 — Semantic Retrieval:
     Batch-embed A and B → build FAISS index on B → batch Top-K search
-  Stage 2 — Per-entry Syntactic Verification and Scoring:
-    For each A entry: fuzzy score + legal form score + composite score
-    Select best candidate by composite_score
-  Stage 3 — Routing (M2 placeholder, inline threshold comparison):
-    AUTO_MATCH | REVIEW | NO_MATCH
-    review_priority = 0 (M2 sentinel — M3 ThresholdRouter overwrites with 1/2/3)
+  Stage 2 — Per-entry Scoring:
+    For each A entry and each Top-K candidate:
+      fuzzy score + legal form score + composite score → ScoreVector → MatchCandidate
+  Stage 3 — Rank + Route (M3):
+    Sort candidates by composite_score descending → assign rank (0 = best)
+    Apply Router to ALL candidates → routing_zone + review_priority per candidate
+    Select best_candidate = candidates[0]
+  Stage 4 — MatchResult construction:
+    Flat fields read from best_candidate.score.*
+    rerank_candidates = full ranked+routed list
 
-Governance controls exercised in this module (see ADR-M2-006):
+Governance controls exercised in this module:
   - run_start event logged at entry
   - match_result / no_match event per A entry
-  - composite_inconsistency guardrail per candidate
+  - composite_inconsistency guardrail per candidate (ADR-M2-005)
+  - FR-LF-05 guardrail via Router.apply() (ADR-M3-002)
   - validation_error + fallback MatchResult on any per-entry exception
-  - run_end event with RunSummary at exit
+  - run_end event with RunSummary (including total_rerank_candidates) at exit
 
 Design constraints:
   - No Streamlit imports
@@ -32,13 +37,16 @@ import uuid
 import traceback
 from collections.abc import Callable
 from datetime import datetime, timezone
+from typing import Literal, cast
 
 from bll.schemas import (
     CompanyRecord,
     LegalFormConfig,
+    MatchCandidate,
     MatchResult,
     RunConfig,
     RunSummary,
+    ScoreVector,
     WeightsConfig,
 )
 from bll.embedder import SentenceTransformerEmbedder
@@ -46,6 +54,7 @@ from bll.faiss_search import FaissSearcher
 from bll.fuzzy_reranker import FuzzyReranker
 from bll.legal_form_scorer import LegalFormScorer
 from bll.composite_scorer import CompositeScorer
+from bll.router import Router
 from governance.audit_logger import AuditLogger
 
 
@@ -72,11 +81,16 @@ class TGFRPipeline:
         self.config = config
         self.logger = audit_logger
 
-        # Instantiate all scoring components from config
+        # Instantiate all scoring and routing components from config
         self.embedder   = SentenceTransformerEmbedder(config.embedding_model)
         self.fuzzy      = FuzzyReranker()
         self.lf_scorer  = LegalFormScorer(config.legal_form_config)
         self.composite  = CompositeScorer(config.weights_config)
+        self.router     = Router(
+            config=config.threshold_config,
+            run_id=config.run_id,
+            audit_logger=audit_logger,
+        )
 
     def run(
         self,
@@ -119,12 +133,10 @@ class TGFRPipeline:
         scores_mat, indices_mat = searcher.search(embeddings_a, top_k=top_k)
 
         # -----------------------------------------------------------------------
-        # Stage 2 + 3 — Per-entry scoring, routing, audit
+        # Stage 2 + 3 + 4 — Per-entry scoring, rank, routing, MatchResult
         # -----------------------------------------------------------------------
 
-        auto_thresh   = self.config.threshold_config.auto_match_threshold
-        review_thresh = self.config.threshold_config.review_lower_threshold
-        ts_now        = datetime.now(timezone.utc).isoformat()
+        ts_now = datetime.now(timezone.utc).isoformat()
 
         for i, rec_a in enumerate(records_a):
             trace_id = str(uuid.uuid4())
@@ -132,7 +144,6 @@ class TGFRPipeline:
                 result = self._score_entry(
                     i, rec_a, records_b,
                     searcher, scores_mat, indices_mat,
-                    auto_thresh, review_thresh,
                     trace_id, ts_now,
                 )
             except Exception as exc:
@@ -170,88 +181,124 @@ class TGFRPipeline:
         searcher: FaissSearcher,
         scores_mat,
         indices_mat,
-        auto_thresh: float,
-        review_thresh: float,
         trace_id: str,
         ts: str,
     ) -> MatchResult:
-        """Score a single A entry and return its MatchResult."""
+        """
+        Score all Top-K candidates for a single A entry, route them, and return MatchResult.
 
-        candidates = searcher.get_candidate(scores_mat, indices_mat, i)
+        Processing steps (ADR-M3-003):
+          1. Retrieve Top-K (b_idx, cosine) pairs from FAISS.
+          2. For each candidate: compute all four scores → build ScoreVector + MatchCandidate.
+          3. Sort candidates descending by composite_score; assign rank (0 = best).
+          4. Apply Router to all candidates → routing_zone + review_priority per candidate.
+          5. If best candidate is NO_MATCH → _no_match_result().
+          6. Otherwise → construct MatchResult from best candidate (flat fields + rerank list).
+        """
+        raw_candidates = searcher.get_candidate(scores_mat, indices_mat, i)
 
-        # No FAISS candidates → immediate NO_MATCH
-        if not candidates:
+        # No FAISS candidates at all → immediate NO_MATCH
+        if not raw_candidates:
             return self._no_match_result(rec_a, trace_id, ts, best_score=0.0)
 
-        # --- Score every candidate ---
-        scored: list[tuple[float, int, float, float, float, float, str]] = []
-        # (composite_score, b_idx, cosine, jw, ts_ratio, lf_score, lf_relation)
+        # -----------------------------------------------------------------------
+        # Step 2 — Score every candidate, build MatchCandidate + ScoreVector
+        # Scores are stored at compute time and never recomputed (ADR-M3-001).
+        # -----------------------------------------------------------------------
+        candidates: list[MatchCandidate] = []
 
-        for b_idx, cosine_score in candidates:
+        for b_idx, cosine_score in raw_candidates:
             rec_b = records_b[b_idx]
 
             jw, ts_ratio = self.fuzzy.score(
                 rec_a.name_normalized, rec_b.name_normalized
             )
-            lf_score, lf_relation = self.lf_scorer.score(
+            lf_score, lf_relation_str = self.lf_scorer.score(
                 rec_a.source_name, rec_b.source_name
+            )
+            lf_relation = cast(
+                Literal["identical", "related", "conflict", "unknown"], lf_relation_str
             )
             cs = self.composite.score(cosine_score, jw, ts_ratio, lf_score)
 
-            # Composite consistency guardrail (ADR-M2-005)
+            # Composite consistency guardrail (ADR-M2-005) — unchanged from M2
             if not self.composite.verify(cs, cosine_score, jw, ts_ratio, lf_score):
                 self.logger.log_guardrail(
                     guardrail_name="composite_inconsistency",
                     triggered=True,
                     action="entry flagged; best score retained",
                     context={
-                        "source_a_id":   rec_a.source_id,
-                        "b_idx":         b_idx,
-                        "computed":      cs,
-                        "trace_id":      trace_id,
+                        "source_a_id": rec_a.source_id,
+                        "b_idx":       b_idx,
+                        "computed":    cs,
+                        "trace_id":    trace_id,
                     },
                 )
 
-            scored.append((cs, b_idx, cosine_score, jw, ts_ratio, lf_score, lf_relation))
+            candidates.append(MatchCandidate(
+                source_b_id=rec_b.source_id,
+                source_b_name=rec_b.source_name,
+                source_b_name_normalized=rec_b.name_normalized,
+                source_b_legal_form=rec_b.legal_form,
+                score=ScoreVector(
+                    embedding_cosine_score=cosine_score,
+                    jaro_winkler_score=jw,
+                    token_sort_ratio=ts_ratio,
+                    legal_form_score=lf_score,
+                    legal_form_relation=lf_relation,
+                    composite_score=cs,
+                ),
+            ))
 
-        # --- Select best candidate ---
-        best = max(scored, key=lambda x: x[0])
-        best_cs, best_b_idx, best_cosine, best_jw, best_ts, best_lf, best_lf_rel = best
-        best_rec_b = records_b[best_b_idx]
+        # -----------------------------------------------------------------------
+        # Step 3 — Sort descending by composite_score; assign rank (ADR-M3-003)
+        # All three transforms (sort, rank, route) use immutable model_copy().
+        # -----------------------------------------------------------------------
+        candidates.sort(key=lambda c: c.score.composite_score, reverse=True)
+        candidates = [
+            c.model_copy(update={"rank": idx}) for idx, c in enumerate(candidates)
+        ]
 
-        # --- M2 placeholder routing (replaced by ThresholdRouter in M3) ---
-        if best_cs >= auto_thresh:
-            routing_zone = "AUTO_MATCH"
-        elif best_cs >= review_thresh:
-            routing_zone = "REVIEW"
-        else:
-            routing_zone = "NO_MATCH"
+        # -----------------------------------------------------------------------
+        # Step 4 — Apply Router to ALL candidates (ADR-M3-002, ADR-M3-003)
+        # Each candidate gets its own routing_zone + review_priority.
+        # FR-LF-05 guardrail fires inside Router.apply() when applicable.
+        # -----------------------------------------------------------------------
+        candidates = [self.router.apply(c) for c in candidates]
 
-        # review_priority=0 is the M2 sentinel (ge=0 passes Pydantic; M3 router
-        # will overwrite with 1/2/3 — see ADR-M2-006)
-        review_priority = 0
+        # -----------------------------------------------------------------------
+        # Step 5 — NO_MATCH check on best candidate
+        # -----------------------------------------------------------------------
+        best = candidates[0]
 
-        if routing_zone == "NO_MATCH":
-            return self._no_match_result(rec_a, trace_id, ts, best_score=best_cs)
+        if best.routing_zone == "NO_MATCH":
+            return self._no_match_result(
+                rec_a, trace_id, ts, best_score=best.score.composite_score
+            )
 
-        # --- Construct MatchResult (Pydantic validates all score ranges) ---
+        # -----------------------------------------------------------------------
+        # Step 6 — Construct MatchResult
+        # Flat fields read from best.score.* — not recomputed (ADR-M3-001).
+        # rerank_candidates carries the full ranked+routed Top-K list.
+        # -----------------------------------------------------------------------
         match_result = MatchResult(
             source_a_id=rec_a.source_id,
             source_a_name=rec_a.source_name,
             source_a_name_normalized=rec_a.name_normalized,
             source_a_legal_form=rec_a.legal_form,
-            source_b_id=best_rec_b.source_id,
-            source_b_name=best_rec_b.source_name,
-            source_b_name_normalized=best_rec_b.name_normalized,
-            source_b_legal_form=best_rec_b.legal_form,
-            embedding_cosine_score=best_cosine,
-            jaro_winkler_score=best_jw,
-            token_sort_ratio=best_ts,
-            legal_form_score=best_lf,
-            legal_form_relation=best_lf_rel,
-            composite_score=best_cs,
-            routing_zone=routing_zone,
-            review_priority=review_priority,
+            source_b_id=best.source_b_id,
+            source_b_name=best.source_b_name,
+            source_b_name_normalized=best.source_b_name_normalized,
+            source_b_legal_form=best.source_b_legal_form,
+            embedding_cosine_score=best.score.embedding_cosine_score,
+            jaro_winkler_score=best.score.jaro_winkler_score,
+            token_sort_ratio=best.score.token_sort_ratio,
+            legal_form_score=best.score.legal_form_score,
+            legal_form_relation=best.score.legal_form_relation,
+            composite_score=best.score.composite_score,
+            routing_zone=best.routing_zone,
+            review_priority=best.review_priority,
+            rerank_candidates=candidates,
             run_id=self.config.run_id,
             trace_id=trace_id,
             timestamp=ts,
@@ -298,6 +345,7 @@ class TGFRPipeline:
             composite_score=0.0,
             routing_zone="NO_MATCH",
             review_priority=0,
+            rerank_candidates=[],  # explicit empty list — NO_MATCH has no evaluated candidates
             run_id=self.config.run_id,
             trace_id=trace_id,
             timestamp=ts,
@@ -396,11 +444,12 @@ def run_entity_resolution(
     # -----------------------------------------------------------------------
     # RunSummary + run_end audit event
     # -----------------------------------------------------------------------
-    n_total      = len(results)
-    n_auto       = sum(1 for r in results if r.routing_zone == "AUTO_MATCH")
-    n_review     = sum(1 for r in results if r.routing_zone == "REVIEW")
-    n_no_match   = sum(1 for r in results if r.routing_zone == "NO_MATCH")
-    n_error      = 0  # error entries land in NO_MATCH — tracked via validation_error events
+    n_total   = len(results)
+    n_auto    = sum(1 for r in results if r.routing_zone == "AUTO_MATCH")
+    n_review  = sum(1 for r in results if r.routing_zone == "REVIEW")
+    n_no_match = sum(1 for r in results if r.routing_zone == "NO_MATCH")
+    n_error   = 0  # error entries land in NO_MATCH — tracked via validation_error events
+    n_rerank  = sum(len(r.rerank_candidates) for r in results)  # M3: total evaluated candidates
 
     review_warn_thresh = 0.30  # default monitoring threshold
 
@@ -420,6 +469,7 @@ def run_entity_resolution(
         output_file_path=out_path,
         review_file_path=review_path,
         audit_log_path=str(audit_logger.path),
+        total_rerank_candidates=n_rerank,  # M3: written to run_end JSONL event
     )
 
     audit_logger.log_run_end(summary)
