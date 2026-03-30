@@ -2,26 +2,33 @@
 Governance — AuditLogger
 
 Append-only JSONL audit logger for the TGFR pipeline.
-All events are written to logs/audit/audit_<run_id>.jsonl.
+All events are written to logs/audit/audit_<YYYYMMDD-HHmm>_<run_id>.jsonl.
+
+Filename includes a YYYYMMDD-HHmm datetime prefix (ADR-M3-004) for chronological
+sortability in file explorers. The prefix is derived from datetime.now() at
+construction time — AuditLogger is always instantiated at run-start in app_service.py.
 
 Every event carries:
   - event_type  : identifies the event category
   - run_id      : correlates all events in a single pipeline run
-  - timestamp   : UTC ISO 8601 write time
+  - timestamp   : UTC ISO 8601 write time (injected by _write())
 
 Per-write open/close (mode='a') guarantees crash safety — events written
-before a crash are never lost. See ADR-009 for design rationale.
-
-All fields are JSON-serializable via Pydantic model_dump() directly —
-no pre-processor needed (frozenset removed from domain model, see ADR-006 refactor).
+before a crash are never lost.
 
 Event types:
   run_start          : full RunConfig at start of run
-  match_result       : MatchResult with complete score vector
+  match_result       : explicit score vector fields + rerank_count (not full list)
   no_match           : NO_MATCH entry with best candidate score for diagnosis
   guardrail_triggered: guardrail name, trigger condition, action taken
   validation_error   : error type and affected entry context
   run_end            : RunSummary with counts, rates, output file paths
+
+Design note (ADR-M3-004):
+  log_match_result emits an explicit field set — NOT result.model_dump().
+  After M3, model_dump() would include rerank_candidates (full list), making
+  the JSONL verbose. Only rerank_count (integer) is written to JSONL.
+  The full rerank list is in the output JSON (dal/output_writer.py).
 
 No Streamlit imports. No BLL logic. No external API calls.
 """
@@ -44,7 +51,11 @@ class AuditLogger:
 
     def __init__(self, run_id: str, audit_dir: str = "logs/audit"):
         self.run_id = run_id
-        self.path = Path(audit_dir) / f"audit_{run_id}.jsonl"
+        # Datetime prefix for chronological sortability (ADR-M3-004).
+        # datetime.now() at construction is always the run-start time —
+        # AuditLogger is instantiated at run-start in app_service.py.
+        _prefix = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+        self.path = Path(audit_dir) / f"audit_{_prefix}_{run_id}.jsonl"
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -98,18 +109,43 @@ class AuditLogger:
 
     def log_match_result(self, result: MatchResult) -> None:
         """
-        Log a single matching decision with its complete score vector.
+        Log a single matching decision with its complete flat score vector.
 
-        Satisfies EU AI Act Art. 12 (record-keeping) and
-        MaRisk AT 4.3.4 (data quality decision traceability).
+        Emits an explicit field set — NOT result.model_dump() — to exclude
+        rerank_candidates (full list) and instead emit rerank_count (integer).
+        The full rerank list is written to the output JSON by OutputWriter.
+        This keeps the JSONL audit log compact and scannable (ADR-M3-004).
+
+        rerank_count enables run-level completeness verification:
+          sum(rerank_count across all match_result events) == RunSummary.total_rerank_candidates
+
+        Satisfies EU AI Act Art. 12 (record-keeping), FR-SCR-02 (all individual
+        scores captured per match decision), and MaRisk AT 4.3.4 (data quality
+        decision traceability).
 
         Args:
-            result: MatchResult — all score components, routing zone,
-                    review priority, source IDs, and trace ID.
+            result: MatchResult with fully populated score vector and rerank list.
         """
         self._write({
-            "event_type": "match_result",
-            **result.model_dump(),
+            "event_type":               "match_result",
+            "trace_id":                 result.trace_id,
+            "source_a_id":              result.source_a_id,
+            "source_a_name":            result.source_a_name,
+            "source_a_name_normalized": result.source_a_name_normalized,
+            "source_a_legal_form":      result.source_a_legal_form,
+            "source_b_id":              result.source_b_id,
+            "source_b_name":            result.source_b_name,
+            "source_b_name_normalized": result.source_b_name_normalized,
+            "source_b_legal_form":      result.source_b_legal_form,
+            "embedding_cosine_score":   result.embedding_cosine_score,
+            "jaro_winkler_score":       result.jaro_winkler_score,
+            "token_sort_ratio":         result.token_sort_ratio,
+            "legal_form_score":         result.legal_form_score,
+            "legal_form_relation":      result.legal_form_relation,
+            "composite_score":          result.composite_score,
+            "routing_zone":             result.routing_zone,
+            "review_priority":          result.review_priority,
+            "rerank_count":             len(result.rerank_candidates),
         })
 
     def log_no_match(

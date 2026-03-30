@@ -34,7 +34,7 @@ from bll.schemas import (
     CompanyRecord, LegalFormConfig, RunConfig,
     ThresholdConfig, WeightsConfig,
 )
-from bll.pipeline import TGFRPipeline
+from bll.ertrace_pipeline import ERTracePipeline
 from dal.normalizer import CompanyNameNormalizer
 from governance.audit_logger import AuditLogger
 
@@ -364,7 +364,7 @@ def test_score_vector_completeness_in_audit_log():
 
     M2 exit criterion: 'match_result events in audit JSONL contain all 5 score fields'
 
-    Uses TGFRPipeline directly (no file I/O, no output writing).
+    Uses ERTracePipeline directly (no file I/O, no output writing).
     RunConfig is constructed synthetically — no YAML required.
     """
     REQUIRED_SCORE_FIELDS = {
@@ -419,7 +419,7 @@ def test_score_vector_completeness_in_audit_log():
         audit_logger = AuditLogger(run_id=run_id, audit_dir=tmpdir)
         audit_logger.log_run_start(config)
 
-        pipeline = TGFRPipeline(config, audit_logger)
+        pipeline = ERTracePipeline(config, audit_logger)
         results  = pipeline.run(records_a, records_b)
 
         # Read audit log

@@ -8,8 +8,8 @@ Two-file resolution (see ADR-M2-006):
   2. config/versions/<ver>.yaml  → reads all parameters (embedding, faiss, thresholds,
                                     weights, legal_form, monitoring)
 
-Constructs RunConfig (Pydantic) — the only input TGFRPipeline needs.
-All YAML parsing is isolated here. TGFRPipeline never touches the filesystem.
+Constructs RunConfig (Pydantic) — the only input ERTracePipeline needs.
+All YAML parsing is isolated here. ERTracePipeline never touches the filesystem.
 
 No Streamlit imports. No BLL logic. No external API calls.
 """
@@ -41,7 +41,7 @@ def load_run_config(
         config_path: Path to config/config.yaml (contains active_version pointer).
 
     Returns:
-        Fully validated RunConfig ready for TGFRPipeline.
+        Fully validated RunConfig ready for ERTracePipeline.
 
     Raises:
         FileNotFoundError: If config.yaml or the versioned YAML cannot be found.
