@@ -1,36 +1,37 @@
 """
-BLL — TGFRPipeline
+BLL — ERTracePipeline
 
-TGFR (Transformer-Gather, Fuzzy-Reconsider) pipeline orchestrator.
-Wires all BLL components into a complete entity resolution run.
+Entity Resolution engine with full score and audit Trace.
 
-Processing sequence (ADR-M2-006, updated M3 per ADR-M3-003):
+Implements the TGFR algorithm (Transformer-Gather, Fuzzy-Reconsider):
   Stage 1 — Semantic Retrieval:
     Batch-embed A and B → build FAISS index on B → batch Top-K search
   Stage 2 — Per-entry Scoring:
     For each A entry and each Top-K candidate:
       fuzzy score + legal form score + composite score → ScoreVector → MatchCandidate
-  Stage 3 — Rank + Route (M3):
+  Stage 3 — Rank + Route (ADR-M3-003):
     Sort candidates by composite_score descending → assign rank (0 = best)
     Apply Router to ALL candidates → routing_zone + review_priority per candidate
     Select best_candidate = candidates[0]
   Stage 4 — MatchResult construction:
-    Flat fields read from best_candidate.score.*
+    Flat fields read from best_candidate.score.* (never recomputed — ADR-M3-001)
     rerank_candidates = full ranked+routed list
 
-Governance controls exercised in this module:
-  - run_start event logged at entry
+Governance controls (ADR-M2-006, ADR-M3-002, ADR-M3-003):
   - match_result / no_match event per A entry
   - composite_inconsistency guardrail per candidate (ADR-M2-005)
   - FR-LF-05 guardrail via Router.apply() (ADR-M3-002)
   - validation_error + fallback MatchResult on any per-entry exception
-  - run_end event with RunSummary (including total_rerank_candidates) at exit
 
-Design constraints:
+Design constraints (ADR-M3-003b):
   - No Streamlit imports
-  - No YAML / filesystem access (config loaded externally via config/config_loader.py)
+  - No config/YAML/filesystem access — RunConfig loaded externally by app_service.py
   - No direct DAL access except CompanyRecord (schema) — normalisation done by caller
-  - TGFRPipeline is framework-agnostic; run_entity_resolution() is the top-level entry point
+  - No OutputWriter — output writing handled by app_service.py
+  - Fully framework-agnostic; usable directly in tests without file I/O
+
+See bll/app_service.py for the cross-layer entry point that wires this engine
+to config loading, DAL normalisation, OutputWriter, and audit logging.
 """
 
 import uuid
@@ -41,13 +42,10 @@ from typing import Literal, cast
 
 from bll.schemas import (
     CompanyRecord,
-    LegalFormConfig,
     MatchCandidate,
     MatchResult,
     RunConfig,
-    RunSummary,
     ScoreVector,
-    WeightsConfig,
 )
 from bll.embedder import SentenceTransformerEmbedder
 from bll.faiss_search import FaissSearcher
@@ -58,21 +56,21 @@ from bll.router import Router
 from governance.audit_logger import AuditLogger
 
 
-class TGFRPipeline:
+class ERTracePipeline:
     """
-    Framework-agnostic TGFR pipeline orchestrator.
+    Entity Resolution engine — pure BLL, no filesystem or framework dependencies.
 
-    Receives a fully-constructed RunConfig and AuditLogger — no filesystem access,
-    no YAML parsing. All governance events are emitted through AuditLogger.
+    Receives a fully-constructed RunConfig and AuditLogger; executes the full
+    TGFR matching sequence; returns one MatchResult per Source A entry.
 
     Usage:
-        pipeline = TGFRPipeline(config, audit_logger)
-        results = pipeline.run(records_a, records_b, progress_callback=cb)
+        engine = ERTracePipeline(config, audit_logger)
+        results = engine.run(records_a, records_b, progress_callback=cb)
     """
 
     def __init__(self, config: RunConfig, audit_logger: AuditLogger) -> None:
         """
-        Initialise all BLL components from RunConfig.
+        Initialise all BLL scoring and routing components from RunConfig.
 
         Args:
             config:       Fully validated RunConfig (from config_loader.py).
@@ -81,7 +79,6 @@ class TGFRPipeline:
         self.config = config
         self.logger = audit_logger
 
-        # Instantiate all scoring and routing components from config
         self.embedder   = SentenceTransformerEmbedder(config.embedding_model)
         self.fuzzy      = FuzzyReranker()
         self.lf_scorer  = LegalFormScorer(config.legal_form_config)
@@ -102,8 +99,8 @@ class TGFRPipeline:
         Execute the full TGFR matching pipeline.
 
         Produces exactly one MatchResult per Source A entry (100% left-join coverage).
-        Errors on individual entries are caught, logged, and produce a fallback
-        NO_MATCH MatchResult — the pipeline never aborts mid-run.
+        Per-entry exceptions are caught, logged, and produce a fallback NO_MATCH —
+        the engine never aborts mid-run.
 
         Args:
             records_a:         Normalised CompanyRecord list for Source A (CRM).
@@ -113,15 +110,14 @@ class TGFRPipeline:
         Returns:
             List of MatchResult, same length as records_a.
         """
-        n = len(records_a)
+        n      = len(records_a)
+        top_k  = self.config.faiss_top_k
         results: list[MatchResult] = []
-        top_k = self.config.faiss_top_k
 
         # -----------------------------------------------------------------------
         # Stage 1 — Semantic Retrieval
+        # Batch-embed all names; single model call each (ADR-M2-001).
         # -----------------------------------------------------------------------
-
-        # Embed all names in a single batch call each (ADR-M2-001)
         names_a = [r.name_normalized for r in records_a]
         names_b = [r.name_normalized for r in records_b]
 
@@ -133,9 +129,8 @@ class TGFRPipeline:
         scores_mat, indices_mat = searcher.search(embeddings_a, top_k=top_k)
 
         # -----------------------------------------------------------------------
-        # Stage 2 + 3 + 4 — Per-entry scoring, rank, routing, MatchResult
+        # Stages 2–4 — Per-entry scoring, rank, routing, MatchResult
         # -----------------------------------------------------------------------
-
         ts_now = datetime.now(timezone.utc).isoformat()
 
         for i, rec_a in enumerate(records_a):
@@ -185,25 +180,23 @@ class TGFRPipeline:
         ts: str,
     ) -> MatchResult:
         """
-        Score all Top-K candidates for a single A entry, route them, and return MatchResult.
+        Score all Top-K candidates for one A entry, route them, return MatchResult.
 
-        Processing steps (ADR-M3-003):
-          1. Retrieve Top-K (b_idx, cosine) pairs from FAISS.
-          2. For each candidate: compute all four scores → build ScoreVector + MatchCandidate.
-          3. Sort candidates descending by composite_score; assign rank (0 = best).
-          4. Apply Router to all candidates → routing_zone + review_priority per candidate.
-          5. If best candidate is NO_MATCH → _no_match_result().
-          6. Otherwise → construct MatchResult from best candidate (flat fields + rerank list).
+        Steps (ADR-M3-003):
+          1. Retrieve Top-K (b_idx, cosine) from FAISS.
+          2. Per candidate: four scores → ScoreVector → MatchCandidate (store-at-compute-time).
+          3. Sort descending by composite_score; assign rank (0 = best).
+          4. Router.apply() on all candidates — routing_zone + review_priority per candidate.
+          5. If best.routing_zone == NO_MATCH → _no_match_result().
+          6. Construct MatchResult: flat fields from best.score.*, rerank_candidates=all.
         """
         raw_candidates = searcher.get_candidate(scores_mat, indices_mat, i)
 
-        # No FAISS candidates at all → immediate NO_MATCH
         if not raw_candidates:
             return self._no_match_result(rec_a, trace_id, ts, best_score=0.0)
 
         # -----------------------------------------------------------------------
-        # Step 2 — Score every candidate, build MatchCandidate + ScoreVector
-        # Scores are stored at compute time and never recomputed (ADR-M3-001).
+        # Step 2 — Score every candidate; build MatchCandidate + ScoreVector
         # -----------------------------------------------------------------------
         candidates: list[MatchCandidate] = []
 
@@ -221,7 +214,7 @@ class TGFRPipeline:
             )
             cs = self.composite.score(cosine_score, jw, ts_ratio, lf_score)
 
-            # Composite consistency guardrail (ADR-M2-005) — unchanged from M2
+            # Composite consistency guardrail (ADR-M2-005)
             if not self.composite.verify(cs, cosine_score, jw, ts_ratio, lf_score):
                 self.logger.log_guardrail(
                     guardrail_name="composite_inconsistency",
@@ -251,8 +244,7 @@ class TGFRPipeline:
             ))
 
         # -----------------------------------------------------------------------
-        # Step 3 — Sort descending by composite_score; assign rank (ADR-M3-003)
-        # All three transforms (sort, rank, route) use immutable model_copy().
+        # Step 3 — Sort descending; assign rank (ADR-M3-003)
         # -----------------------------------------------------------------------
         candidates.sort(key=lambda c: c.score.composite_score, reverse=True)
         candidates = [
@@ -260,8 +252,7 @@ class TGFRPipeline:
         ]
 
         # -----------------------------------------------------------------------
-        # Step 4 — Apply Router to ALL candidates (ADR-M3-002, ADR-M3-003)
-        # Each candidate gets its own routing_zone + review_priority.
+        # Step 4 — Route all candidates (ADR-M3-002, ADR-M3-003)
         # FR-LF-05 guardrail fires inside Router.apply() when applicable.
         # -----------------------------------------------------------------------
         candidates = [self.router.apply(c) for c in candidates]
@@ -278,8 +269,7 @@ class TGFRPipeline:
 
         # -----------------------------------------------------------------------
         # Step 6 — Construct MatchResult
-        # Flat fields read from best.score.* — not recomputed (ADR-M3-001).
-        # rerank_candidates carries the full ranked+routed Top-K list.
+        # Flat fields from best.score.* — never recomputed (ADR-M3-001).
         # -----------------------------------------------------------------------
         match_result = MatchResult(
             source_a_id=rec_a.source_id,
@@ -319,7 +309,7 @@ class TGFRPipeline:
         Construct a NO_MATCH MatchResult for a Source A entry.
 
         All Source B fields are None. All scores are 0.0.
-        legal_form_relation defaults to "unknown" (no information).
+        rerank_candidates is explicitly empty — no candidates were above threshold.
         """
         if log:
             self.logger.log_no_match(
@@ -345,133 +335,8 @@ class TGFRPipeline:
             composite_score=0.0,
             routing_zone="NO_MATCH",
             review_priority=0,
-            rerank_candidates=[],  # explicit empty list — NO_MATCH has no evaluated candidates
+            rerank_candidates=[],
             run_id=self.config.run_id,
             trace_id=trace_id,
             timestamp=ts,
         )
-
-
-# ---------------------------------------------------------------------------
-# Top-level entry point — callable without Streamlit (CLI, Python API)
-# ---------------------------------------------------------------------------
-
-def run_entity_resolution(
-    source_a_path: str,
-    source_b_path: str,
-    config_path: str = "config/config.yaml",
-    progress_callback: Callable[[int, int], None] | None = None,
-) -> tuple[list[MatchResult], RunSummary]:
-    """
-    Top-level entity resolution entry point.
-
-    Handles config loading, DAL normalisation, pipeline execution, output writing,
-    and audit logging. Framework-agnostic — callable from CLI, tests, or Streamlit.
-
-    Args:
-        source_a_path:     Path to Source A CSV or JSON file.
-        source_b_path:     Path to Source B CSV or JSON file.
-        config_path:       Path to config/config.yaml (active version pointer).
-        progress_callback: Optional callback(completed: int, total: int).
-
-    Returns:
-        Tuple of (list[MatchResult], RunSummary).
-    """
-    # Deferred imports to keep pipeline.py free of filesystem/DAL concerns
-    # when used in unit-test contexts that instantiate TGFRPipeline directly.
-    from config.config_loader import load_run_config
-    from dal.input_loader import InputLoader
-    from dal.normalizer import CompanyNameNormalizer
-    from dal.legal_form_extractor import LegalFormExtractor
-    from dal.output_writer import OutputWriter
-
-    # -----------------------------------------------------------------------
-    # Config — algorithm parameters only, no data paths (see ADR-M2-006)
-    # -----------------------------------------------------------------------
-    config = load_run_config(config_path)
-
-    # -----------------------------------------------------------------------
-    # Load raw records — InputLoader validates paths before they are recorded
-    # -----------------------------------------------------------------------
-    loader = InputLoader()
-    raw_a = loader.load(source_a_path)
-    raw_b = loader.load(source_b_path)
-
-    # -----------------------------------------------------------------------
-    # Normalise → CompanyRecord
-    # -----------------------------------------------------------------------
-    normalizer = CompanyNameNormalizer()
-    extractor  = LegalFormExtractor()
-
-    def to_company_record(raw: dict) -> CompanyRecord:
-        raw_name      = str(raw["source_name"])
-        term, _, _    = extractor.extract(raw_name)
-        normalized    = normalizer.normalize(raw_name)
-        return CompanyRecord(
-            source_id=str(raw["source_id"]),
-            source_name=raw_name,
-            name_normalized=normalized,
-            legal_form=term,
-        )
-
-    records_a = [to_company_record(r) for r in raw_a]
-    records_b = [to_company_record(r) for r in raw_b]
-
-    # -----------------------------------------------------------------------
-    # Pipeline execution
-    # Paths passed to log_run_start only after InputLoader has validated them —
-    # the audit record captures confirmed, real file paths (see ADR-M2-006)
-    # -----------------------------------------------------------------------
-    ts_start    = datetime.now(timezone.utc).isoformat()
-    audit_logger = AuditLogger(run_id=config.run_id)
-    audit_logger.log_run_start(
-        config,
-        input_file_a=source_a_path,
-        input_file_b=source_b_path,
-    )
-
-    pipeline = TGFRPipeline(config, audit_logger)
-    results  = pipeline.run(records_a, records_b, progress_callback)
-
-    # -----------------------------------------------------------------------
-    # Output files
-    # -----------------------------------------------------------------------
-    ts_end  = datetime.now(timezone.utc).isoformat()
-    writer  = OutputWriter()
-    out_path    = writer.write_output_json(results, config.run_id, ts_end)
-    review_path = writer.write_review_json(results, config.run_id, ts_end)
-
-    # -----------------------------------------------------------------------
-    # RunSummary + run_end audit event
-    # -----------------------------------------------------------------------
-    n_total   = len(results)
-    n_auto    = sum(1 for r in results if r.routing_zone == "AUTO_MATCH")
-    n_review  = sum(1 for r in results if r.routing_zone == "REVIEW")
-    n_no_match = sum(1 for r in results if r.routing_zone == "NO_MATCH")
-    n_error   = 0  # error entries land in NO_MATCH — tracked via validation_error events
-    n_rerank  = sum(len(r.rerank_candidates) for r in results)  # M3: total evaluated candidates
-
-    review_warn_thresh = 0.30  # default monitoring threshold
-
-    summary = RunSummary(
-        run_id=config.run_id,
-        timestamp_start=ts_start,
-        timestamp_end=ts_end,
-        total_entries_a=n_total,
-        count_auto_match=n_auto,
-        count_review=n_review,
-        count_no_match=n_no_match,
-        count_error=n_error,
-        auto_match_quote=round(n_auto / n_total, 4) if n_total else 0.0,
-        review_quote=round(n_review / n_total, 4) if n_total else 0.0,
-        no_match_quote=round(n_no_match / n_total, 4) if n_total else 0.0,
-        review_quote_warning=(n_review / n_total > review_warn_thresh) if n_total else False,
-        output_file_path=out_path,
-        review_file_path=review_path,
-        audit_log_path=str(audit_logger.path),
-        total_rerank_candidates=n_rerank,  # M3: written to run_end JSONL event
-    )
-
-    audit_logger.log_run_end(summary)
-
-    return results, summary

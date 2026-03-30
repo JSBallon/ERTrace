@@ -1,7 +1,7 @@
 # run_faker.py — temporary runner, not committed
 import csv, pathlib, tempfile, os
 from dal.data_generator import FakerDataGenerator
-from bll.pipeline import run_entity_resolution
+from bll.app_service import run_entity_resolution
 
 N_A = 20   # Source A entries (CRM)
 N_B = 30   # Source B entries (Core Banking)
