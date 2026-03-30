@@ -5,6 +5,14 @@ All score fields are constrained to [0.0, 1.0].
 WeightsConfig enforces sum = 1.0 (± 0.001 floating-point tolerance).
 ThresholdConfig enforces review_lower_threshold < auto_match_threshold.
 
+M3 additions (ADR-M3-001):
+  - ScoreVector: 6 score fields as a sub-model — stored at compute time, never recomputed.
+  - MatchCandidate: one Top-K candidate from Source B — uniform type for rerank list and
+    best match. Routing fields (routing_zone, review_priority) belong here; set by Router.
+  - MatchResult: extended with rerank_candidates: list[MatchCandidate]. All flat fields
+    remain unchanged for audit log compatibility.
+  - RunSummary: extended with total_rerank_candidates: int for run_end JSONL event.
+
 No Streamlit imports. No filesystem access. No external API calls.
 """
 
@@ -19,6 +27,47 @@ class CompanyRecord(BaseModel):
     name_normalized: str
     legal_form: str | None = None
     legal_form_class: Literal["identical", "related", "conflict", "unknown"] | None = None
+
+
+# ---------------------------------------------------------------------------
+# M3: ScoreVector + MatchCandidate (ADR-M3-001)
+# ---------------------------------------------------------------------------
+
+class ScoreVector(BaseModel):
+    """Score components for one candidate pair — stored at compute time, never recomputed.
+
+    Used as MatchCandidate.score. All six components are required and constrained [0.0, 1.0]
+    (or a valid Literal for legal_form_relation).
+
+    Design rule: OutputWriter reads these fields to build the nested JSON output.
+    It must never recompute or derive scores — only read what is stored here.
+    """
+    embedding_cosine_score: float = Field(ge=0.0, le=1.0)
+    jaro_winkler_score: float = Field(ge=0.0, le=1.0)
+    token_sort_ratio: float = Field(ge=0.0, le=1.0)
+    legal_form_score: float = Field(ge=0.0, le=1.0)
+    legal_form_relation: Literal["identical", "related", "conflict", "unknown"]
+    composite_score: float = Field(ge=0.0, le=1.0)
+
+
+class MatchCandidate(BaseModel):
+    """One Top-K candidate from Source B.
+
+    Uniform type used for both the selected best match and all rerank list entries.
+    Routing fields (routing_zone, review_priority) belong here — set once by Router,
+    not by pipeline scoring logic.
+
+    rank is set once after the Top-K list is sorted by composite_score descending.
+    rank=0 is the best (selected) candidate; rank=1,2,... are the remaining candidates.
+    """
+    source_b_id: str | None = None
+    source_b_name: str | None = None
+    source_b_name_normalized: str | None = None
+    source_b_legal_form: str | None = None
+    score: ScoreVector
+    routing_zone: Literal["AUTO_MATCH", "REVIEW", "NO_MATCH"] = "REVIEW"
+    review_priority: int = Field(ge=0, le=3, default=0)
+    rank: int = Field(ge=0, default=0)
 
 
 class WeightsConfig(BaseModel):
@@ -78,20 +127,32 @@ class RunConfig(BaseModel):
 
 
 class MatchResult(BaseModel):
-    """Complete matching result with full score vector — primary audit artifact."""
+    """Complete matching result — flat internal type for pipeline and audit log.
+
+    All flat score fields remain unchanged from M2 for audit log compatibility.
+    OutputWriter translates this to the nested entry/match/rerank JSON structure
+    at serialization time — no nesting happens inside this model.
+
+    rerank_candidates carries the full Top-K list (populated in M3 pipeline).
+    OutputWriter serializes it as the rerank[] array in the output JSON.
+    AuditLogger writes only rerank_count (integer) — not the full list.
+
+    See ADR-M3-001 for the rationale behind the flat+rerank_candidates dual structure.
+    """
     # Source A fields
     source_a_id: str
     source_a_name: str
     source_a_name_normalized: str
     source_a_legal_form: str | None = None
 
-    # Source B fields (None for NO_MATCH entries)
+    # Source B fields — None for NO_MATCH entries
     source_b_id: str | None = None
     source_b_name: str | None = None
     source_b_name_normalized: str | None = None
     source_b_legal_form: str | None = None
 
-    # Score vector — all components constrained [0.0, 1.0]
+    # Score vector — flat fields, all constrained [0.0, 1.0]
+    # Mirrors the best MatchCandidate's ScoreVector for audit log compatibility.
     embedding_cosine_score: float = Field(ge=0.0, le=1.0)
     jaro_winkler_score: float = Field(ge=0.0, le=1.0)
     token_sort_ratio: float = Field(ge=0.0, le=1.0)
@@ -102,6 +163,10 @@ class MatchResult(BaseModel):
     composite_score: float = Field(ge=0.0, le=1.0)
     routing_zone: Literal["AUTO_MATCH", "REVIEW", "NO_MATCH"]
     review_priority: int = Field(ge=0, le=3)
+
+    # Full Top-K rerank list (M3) — serialized as rerank[] in output JSON.
+    # Empty list for NO_MATCH entries. Default keeps M2 compatibility.
+    rerank_candidates: list[MatchCandidate] = Field(default_factory=list)
 
     # Traceability
     run_id: str
@@ -126,3 +191,7 @@ class RunSummary(BaseModel):
     output_file_path: str
     review_file_path: str
     audit_log_path: str
+    # M3: total rerank candidates across the run — written to run_end JSONL event.
+    # Enables completeness verification: total_rerank_candidates == total_entries_a * top_k
+    # for all non-NO_MATCH entries.
+    total_rerank_candidates: int = 0
