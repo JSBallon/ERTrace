@@ -67,19 +67,33 @@ class AuditLogger:
     # Public log methods
     # ------------------------------------------------------------------
 
-    def log_run_start(self, config: RunConfig) -> None:
+    def log_run_start(
+        self,
+        config: RunConfig,
+        input_file_a: str = "",
+        input_file_b: str = "",
+    ) -> None:
         """
         Log the start of a pipeline run with the full configuration.
 
         Satisfies EU AI Act Art. 11 (technical documentation) and
         MaRisk AT 7.2 (run configuration traceability).
 
+        Input file paths are passed separately from RunConfig because they are
+        run-time data pointers, not algorithm configuration parameters.
+        They are validated by InputLoader before being recorded here — ensuring
+        the audit record only captures paths confirmed to exist.
+
         Args:
-            config: Full RunConfig — all parameters captured verbatim.
+            config:       Full RunConfig — all algorithm parameters captured verbatim.
+            input_file_a: Validated path to Source A input file (CRM).
+            input_file_b: Validated path to Source B input file (Core Banking).
         """
         self._write({
             "event_type": "run_start",
             **config.model_dump(),
+            "input_file_a": input_file_a,
+            "input_file_b": input_file_b,
         })
 
     def log_match_result(self, result: MatchResult) -> None:

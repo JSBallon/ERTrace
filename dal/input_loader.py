@@ -55,7 +55,7 @@ class InputLoader:
             InputValidationError: If required fields are missing.
         """
         try:
-            df = pd.read_csv(path, dtype=str)
+            df = pd.read_csv(path, dtype=str, encoding="utf-8")
         except FileNotFoundError:
             raise FileNotFoundError(f"Source file not found: {path}")
 

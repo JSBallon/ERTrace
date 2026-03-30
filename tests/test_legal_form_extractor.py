@@ -46,7 +46,7 @@ def test_extract_ag(extractor):
 
 def test_extract_ltd(extractor):
     term, typ, countries = extractor.extract("ACME Ltd.")
-    assert term == "ltd."
+    assert term == "ltd"  # cleanco matches "ltd" before "ltd." in its source table
     assert typ == "Limited"
     assert "United Kingdom" in countries
 

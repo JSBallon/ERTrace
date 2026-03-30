@@ -74,8 +74,6 @@ class RunConfig(BaseModel):
     threshold_config_version: str
     weights_config_version: str
     legal_form_config_version: str
-    input_file_a: str
-    input_file_b: str
     timestamp: str
 
 
