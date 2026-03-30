@@ -15,7 +15,7 @@ import pytest
 from pathlib import Path
 from governance.audit_logger import AuditLogger
 from bll.schemas import (
-    MatchResult, RunConfig, RunSummary,
+    MatchCandidate, MatchResult, RunConfig, RunSummary, ScoreVector,
     WeightsConfig, ThresholdConfig, LegalFormConfig,
 )
 
@@ -195,6 +195,69 @@ def test_match_result_contains_trace_id(logger, log_path, match_result):
     assert events[0]["trace_id"] == "trace_001"
 
 
+def test_match_result_contains_rerank_count(logger, log_path, match_result):
+    """rerank_count must be present in the match_result event as an integer (ADR-M3-005)."""
+    logger.log_match_result(match_result)
+    events = _read_events(log_path)
+    e = events[0]
+    assert "rerank_count" in e
+    assert isinstance(e["rerank_count"], int)
+    # match_result fixture has no rerank_candidates (default empty list) → count is 0
+    assert e["rerank_count"] == 0
+
+
+def test_match_result_rerank_count_reflects_candidates(logger, log_path, run_id):
+    """rerank_count must equal len(result.rerank_candidates) — here 3 candidates."""
+    def _sv() -> ScoreVector:
+        return ScoreVector(
+            embedding_cosine_score=0.90,
+            jaro_winkler_score=0.85,
+            token_sort_ratio=0.88,
+            legal_form_score=1.0,
+            legal_form_relation="identical",
+            composite_score=0.88,
+        )
+
+    candidates = [
+        MatchCandidate(source_b_id=f"b{i}", score=_sv(), rank=i)
+        for i in range(3)
+    ]
+
+    result_with_rerank = MatchResult(
+        source_a_id="crm_rc_001",
+        source_a_name="Test GmbH",
+        source_a_name_normalized="test",
+        embedding_cosine_score=0.90,
+        jaro_winkler_score=0.85,
+        token_sort_ratio=0.88,
+        legal_form_score=1.0,
+        legal_form_relation="identical",
+        composite_score=0.88,
+        routing_zone="AUTO_MATCH",
+        review_priority=0,
+        rerank_candidates=candidates,
+        run_id=run_id,
+        trace_id="trace_rc_001",
+        timestamp="2026-03-30T00:00:00Z",
+    )
+
+    logger.log_match_result(result_with_rerank)
+    events = _read_events(log_path)
+    assert events[0]["rerank_count"] == 3
+
+
+def test_match_result_does_not_contain_full_rerank_list(logger, log_path, match_result):
+    """Full rerank_candidates list must NOT appear in the JSONL event — only rerank_count.
+
+    This is the governance contract from ADR-M3-005: the JSONL audit log stays compact.
+    The full list lives in the output JSON (OutputWriter, ADR-M3-004).
+    """
+    logger.log_match_result(match_result)
+    events = _read_events(log_path)
+    e = events[0]
+    assert "rerank_candidates" not in e
+
+
 # ------------------------------------------------------------------
 # no_match event
 # ------------------------------------------------------------------
@@ -281,6 +344,19 @@ def test_run_end_contains_output_paths(logger, log_path, run_summary):
     assert "output_file_path" in e
     assert "review_file_path" in e
     assert "audit_log_path" in e
+
+
+def test_run_end_contains_total_rerank_candidates(logger, log_path, run_summary):
+    """total_rerank_candidates from RunSummary must appear in the run_end event (ADR-M3-005).
+
+    Flows through automatically via RunSummary.model_dump() — no explicit logger code needed.
+    The run_summary fixture uses the default value (0); the test verifies presence and type.
+    """
+    logger.log_run_end(run_summary)
+    events = _read_events(log_path)
+    e = events[0]
+    assert "total_rerank_candidates" in e
+    assert isinstance(e["total_rerank_candidates"], int)
 
 
 # ------------------------------------------------------------------
