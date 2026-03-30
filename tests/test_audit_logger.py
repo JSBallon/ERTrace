@@ -35,8 +35,10 @@ def logger(run_id, tmp_path):
 
 
 @pytest.fixture
-def log_path(run_id, tmp_path):
-    return tmp_path / f"audit_{run_id}.jsonl"
+def log_path(logger):
+    # Derive from the actual logger path — works with any filename format,
+    # including the YYYYMMDD-HHmm datetime prefix introduced in ADR-M3-004.
+    return logger.path
 
 
 @pytest.fixture
@@ -302,7 +304,10 @@ def test_append_only_no_overwrite(run_id, tmp_path, run_config, run_summary):
     logger2 = AuditLogger(run_id=run_id, audit_dir=str(tmp_path))
     logger2.log_run_end(run_summary)
 
-    log_path = tmp_path / f"audit_{run_id}.jsonl"
+    # Use logger1.path — works with any filename format including datetime prefix.
+    # logger1 and logger2 are instantiated within the same second so their
+    # strftime("%Y%m%d-%H%M") prefix is identical — they write to the same file.
+    log_path = logger1.path
     events = _read_events(log_path)
     assert len(events) == 2
     assert events[0]["event_type"] == "run_start"
