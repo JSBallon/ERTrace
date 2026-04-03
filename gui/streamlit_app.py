@@ -310,7 +310,7 @@ def main() -> None:
     # -----------------------------------------------------------------------
     with st.sidebar:
         st.header("Configuration")
-
+        st.subheader("Retrieve")
         model_idx = ALT_MODELS.index(defaults.embedding_model) if defaults.embedding_model in ALT_MODELS else 0
         embedding_model = st.selectbox(
             "Embedding Model", options=ALT_MODELS, index=model_idx,
@@ -319,8 +319,22 @@ def main() -> None:
         faiss_top_k = st.slider(
             "FAISS Top-K", min_value=1, max_value=20, value=defaults.faiss_top_k,
         )
+        st.divider()
+        
+        st.subheader("Rank")
+        w_embedding    = st.slider("w_embedding",    0.00, 1.00, defaults.weights_config.w_embedding,    0.05)
+        w_jaro_winkler = st.slider("w_jaro_winkler", 0.00, 1.00, defaults.weights_config.w_jaro_winkler, 0.05)
+        w_token_sort   = st.slider("w_token_sort",   0.00, 1.00, defaults.weights_config.w_token_sort,   0.05)
+        w_legal_form   = st.slider("w_legal_form",   0.00, 1.00, defaults.weights_config.w_legal_form,   0.05)
 
-        st.subheader("Thresholds")
+        total_w   = w_embedding + w_jaro_winkler + w_token_sort + w_legal_form
+        weight_ok = abs(total_w - 1.0) <= WEIGHT_TOLERANCE
+        st.metric("Weight Sum", f"{total_w:.3f}")
+        if not weight_ok:
+            st.warning(f"Weights sum to {total_w:.3f} — must equal 1.000")
+        st.divider()
+
+        st.subheader("Route")
         auto_match_threshold = st.slider(
             "Auto-Match Threshold", 0.50, 1.00,
             value=defaults.threshold_config.auto_match_threshold, step=0.01,
@@ -335,18 +349,7 @@ def main() -> None:
                 f"Review lower ({review_lower_threshold:.2f}) must be "
                 f"< Auto-match ({auto_match_threshold:.2f})."
             )
-
-        st.subheader("Composite Weights")
-        w_embedding    = st.slider("w_embedding",    0.00, 1.00, defaults.weights_config.w_embedding,    0.05)
-        w_jaro_winkler = st.slider("w_jaro_winkler", 0.00, 1.00, defaults.weights_config.w_jaro_winkler, 0.05)
-        w_token_sort   = st.slider("w_token_sort",   0.00, 1.00, defaults.weights_config.w_token_sort,   0.05)
-        w_legal_form   = st.slider("w_legal_form",   0.00, 1.00, defaults.weights_config.w_legal_form,   0.05)
-
-        total_w   = w_embedding + w_jaro_winkler + w_token_sort + w_legal_form
-        weight_ok = abs(total_w - 1.0) <= WEIGHT_TOLERANCE
-        st.metric("Weight Sum", f"{total_w:.3f}")
-        if not weight_ok:
-            st.warning(f"Weights sum to {total_w:.3f} — must equal 1.000")
+        st.divider()
 
         st.subheader("Monitoring")
         review_warn_threshold = st.slider("REVIEW Rate Warning", 0.00, 1.00, 0.30, 0.05)
@@ -385,11 +388,40 @@ def main() -> None:
                 with st.expander("Changed vs. YAML defaults"):
                     for f, diff in st.session_state.last_changed_fields.items():
                         st.caption(f"`{f}`: {diff['from']} → {diff['to']}")
-
+    
     st.divider()
 
+    # --- File upload (independent of Faker generation) ---
+    st.subheader("Input Files")
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        source_a_file = st.file_uploader("Source A", type=["csv", "json"])
+        if source_a_file is not None:
+            _cleanup_temp(st.session_state.temp_a_path)
+            st.session_state.temp_a_path = _save_upload_to_temp(source_a_file, "upload_a_")
+            st.session_state.faker_k     = 0
+        if st.session_state.temp_a_path:
+            is_faker = st.session_state.faker_k > 0 and source_a_file is None
+            tag      = f" (Faker, {st.session_state.faker_k} shared)" if is_faker else " (uploaded)"
+            st.caption(f"`{Path(st.session_state.temp_a_path).name}`{tag}")
+
+    with col_b:
+        source_b_file = st.file_uploader("Source B", type=["csv", "json"])
+        if source_b_file is not None:
+            _cleanup_temp(st.session_state.temp_b_path)
+            st.session_state.temp_b_path = _save_upload_to_temp(source_b_file, "upload_b_")
+            st.session_state.faker_k     = 0
+        if st.session_state.temp_b_path:
+            is_faker = st.session_state.faker_k > 0 and source_b_file is None
+            tag      = f" (Faker, {st.session_state.faker_k} shared)" if is_faker else " (uploaded)"
+            st.caption(f"`{Path(st.session_state.temp_b_path).name}`{tag}")
+
+    active_a = st.session_state.temp_a_path
+    active_b = st.session_state.temp_b_path
+
     # --- Faker generation parameters ---
-    st.subheader("Generate Faker Datasets")
+    st.markdown("#### Generate Faker Datasets")
     c_m, c_n, c_ov, c_nr, c_tr = st.columns([1.2, 1.2, 1.6, 1.4, 1.4])
     with c_m:
         n_faker_a = st.number_input("Source A entries (M)", min_value=10,
@@ -441,37 +473,6 @@ def main() -> None:
             f"Generated Source A ({n_faker_a} entries) and "
             f"Source B ({n_faker_b} entries) with {k_actual} shared entries."
         )
-
-    st.divider()
-
-    # --- File upload (independent of Faker generation) ---
-    st.subheader("Input Files")
-    col_a, col_b = st.columns(2)
-
-    with col_a:
-        source_a_file = st.file_uploader("Source A", type=["csv", "json"])
-        if source_a_file is not None:
-            _cleanup_temp(st.session_state.temp_a_path)
-            st.session_state.temp_a_path = _save_upload_to_temp(source_a_file, "upload_a_")
-            st.session_state.faker_k     = 0
-        if st.session_state.temp_a_path:
-            is_faker = st.session_state.faker_k > 0 and source_a_file is None
-            tag      = f" (Faker, {st.session_state.faker_k} shared)" if is_faker else " (uploaded)"
-            st.caption(f"`{Path(st.session_state.temp_a_path).name}`{tag}")
-
-    with col_b:
-        source_b_file = st.file_uploader("Source B", type=["csv", "json"])
-        if source_b_file is not None:
-            _cleanup_temp(st.session_state.temp_b_path)
-            st.session_state.temp_b_path = _save_upload_to_temp(source_b_file, "upload_b_")
-            st.session_state.faker_k     = 0
-        if st.session_state.temp_b_path:
-            is_faker = st.session_state.faker_k > 0 and source_b_file is None
-            tag      = f" (Faker, {st.session_state.faker_k} shared)" if is_faker else " (uploaded)"
-            st.caption(f"`{Path(st.session_state.temp_b_path).name}`{tag}")
-
-    active_a = st.session_state.temp_a_path
-    active_b = st.session_state.temp_b_path
 
     st.divider()
 
