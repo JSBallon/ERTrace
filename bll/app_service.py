@@ -23,7 +23,7 @@ No Streamlit imports. Filesystem access via config/ and dal/ layers only.
 from collections.abc import Callable
 from datetime import datetime, timezone
 
-from bll.schemas import CompanyRecord, MatchResult, RunSummary
+from bll.schemas import CompanyRecord, MatchResult, RunConfig, RunSummary
 from bll.ertrace_pipeline import ERTracePipeline
 from governance.audit_logger import AuditLogger
 
@@ -32,6 +32,8 @@ def run_entity_resolution(
     source_a_path: str,
     source_b_path: str,
     config_path: str = "config/config.yaml",
+    run_config: RunConfig | None = None,
+    config_adjustments: dict | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> tuple[list[MatchResult], RunSummary]:
     """
@@ -41,10 +43,15 @@ def run_entity_resolution(
     and audit logging. Framework-agnostic — callable from CLI, tests, or Streamlit.
 
     Args:
-        source_a_path:     Path to Source A CSV or JSON file.
-        source_b_path:     Path to Source B CSV or JSON file.
-        config_path:       Path to config/config.yaml (active version pointer).
-        progress_callback: Optional callback(completed: int, total: int).
+        source_a_path:      Path to Source A CSV or JSON file.
+        source_b_path:      Path to Source B CSV or JSON file.
+        config_path:        Path to config/config.yaml (active version pointer).
+        run_config:         Optional pre-built RunConfig (from Streamlit UI via
+                            save_ui_config()). If provided, config_path is ignored.
+        config_adjustments: Optional diff dict {field: {"from": v1, "to": v2}} for
+                            UI-adjusted params. Forwarded to log_run_start() and
+                            embedded in the run_start audit event (ADR-M3-006).
+        progress_callback:  Optional callback(completed: int, total: int).
 
     Returns:
         Tuple of (list[MatchResult], RunSummary).
@@ -59,8 +66,9 @@ def run_entity_resolution(
 
     # -----------------------------------------------------------------------
     # Config — algorithm parameters only, no data paths (ADR-M2-006)
+    # Pre-built run_config from Streamlit UI bypasses YAML loading (ADR-M3-006).
     # -----------------------------------------------------------------------
-    config = load_run_config(config_path)
+    config = run_config or load_run_config(config_path)
 
     # -----------------------------------------------------------------------
     # Load raw records — InputLoader validates paths before they are recorded
@@ -100,6 +108,7 @@ def run_entity_resolution(
         config,
         input_file_a=source_a_path,
         input_file_b=source_b_path,
+        config_adjustments=config_adjustments,
     )
 
     engine  = ERTracePipeline(config, audit_logger)

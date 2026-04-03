@@ -161,6 +161,36 @@ def test_run_start_contains_config_versions(logger, log_path, run_config):
     assert events[0]["legal_form_config_version"] == "v1.0-default"
 
 
+def test_run_start_without_adjustments_has_no_config_adjustments_key(logger, log_path, run_config):
+    """Default callers (CLI, tests) pass no config_adjustments — key must be absent (ADR-M3-006)."""
+    logger.log_run_start(run_config)
+    events = _read_events(log_path)
+    assert "config_adjustments" not in events[0]
+
+
+def test_run_start_with_adjustments_embeds_diff(logger, log_path, run_config):
+    """UI-adjusted run: config_adjustments diff embedded in run_start event (ADR-M3-006)."""
+    adjustments = {
+        "auto_match_threshold": {"from": 0.92, "to": 0.88},
+        "w_embedding":          {"from": 0.50, "to": 0.40},
+    }
+    logger.log_run_start(run_config, config_adjustments=adjustments)
+    events = _read_events(log_path)
+    e = events[0]
+    assert "config_adjustments" in e
+    assert e["config_adjustments"]["auto_match_threshold"]["from"] == pytest.approx(0.92)
+    assert e["config_adjustments"]["auto_match_threshold"]["to"]   == pytest.approx(0.88)
+    assert e["config_adjustments"]["w_embedding"]["from"]          == pytest.approx(0.50)
+    assert e["config_adjustments"]["w_embedding"]["to"]            == pytest.approx(0.40)
+
+
+def test_run_start_with_empty_adjustments_has_no_config_adjustments_key(logger, log_path, run_config):
+    """Empty dict behaves the same as None — key must be absent."""
+    logger.log_run_start(run_config, config_adjustments={})
+    events = _read_events(log_path)
+    assert "config_adjustments" not in events[0]
+
+
 # ------------------------------------------------------------------
 # match_result event
 # ------------------------------------------------------------------
