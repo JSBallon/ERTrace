@@ -21,9 +21,11 @@ opencode.json
 ~/.cache/huggingface/
 .cache/
 
-# Outputs und Logs
-outputs/
-logs/audit/
+# data und Logs
+inputs/*
+outputs/*
+logs/audit/*
+!inputs/.gitkeep
 !outputs/.gitkeep
 !logs/audit/.gitkeep
 
