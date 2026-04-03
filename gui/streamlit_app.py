@@ -30,6 +30,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+INPUT_DIR = Path("inputs")
+
 import pandas as pd
 import streamlit as st
 
@@ -185,17 +187,28 @@ def _build_run_config(
     return run_config, changed_fields
 
 
-def _write_temp_csv(records: list[dict], prefix: str) -> str:
-    """Write {source_id, source_name} records to a named temp CSV. Returns path."""
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".csv", prefix=prefix,
-        delete=False, encoding="utf-8", newline="",
-    )
-    writer = csv.DictWriter(tmp, fieldnames=["source_id", "source_name"])
-    writer.writeheader()
-    writer.writerows(records)
-    tmp.close()
-    return tmp.name
+def _write_input_csv(records: list[dict], source: str) -> str:
+    """
+    Write Faker-generated records to inputs/<source>_<YYYYMMDD-HHmm>.csv.
+
+    Files are kept permanently — inputs/ mirrors outputs/ and logs/audit/ as a
+    first-class artifact folder. The path is recorded in the run_start audit event.
+
+    Args:
+        records: List of {source_id, source_name} dicts.
+        source:  "source_a" or "source_b" — used as the filename prefix.
+
+    Returns:
+        Absolute path of the written file as a string.
+    """
+    INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    ts   = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+    path = INPUT_DIR / f"{source}_{ts}.csv"
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["source_id", "source_name"])
+        writer.writeheader()
+        writer.writerows(records)
+    return str(path)
 
 
 def _save_upload_to_temp(uploaded_file, prefix: str) -> str:
@@ -279,13 +292,14 @@ def main() -> None:
     )
 
     for key, default in [
-        ("results",             None),
-        ("summary",             None),
-        ("temp_a_path",         None),
-        ("temp_b_path",         None),
-        ("faker_generated",     False),
-        ("last_run_config",     None),
-        ("last_changed_fields", {}),
+        ("results",              None),
+        ("summary",              None),
+        ("temp_a_path",          None),
+        ("temp_b_path",          None),
+        ("faker_a_generated",    False),
+        ("faker_b_generated",    False),
+        ("last_run_config",      None),
+        ("last_changed_fields",  {}),
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
@@ -378,45 +392,63 @@ def main() -> None:
     # --- Input ---
     st.subheader("Input Files")
     col_a, col_b = st.columns(2)
+
     with col_a:
-        source_a_file = st.file_uploader("Source A (CRM)", type=["csv", "json"])
+        source_a_file = st.file_uploader("Source A", type=["csv", "json"])
+        n_faker_a = st.number_input(
+            "Faker entries", min_value=10, max_value=500, value=50, step=10,
+            key="n_faker_a",
+        )
+        faker_a_button = st.button("Generate Faker A", key="btn_faker_a", use_container_width=True)
+
+        if faker_a_button:
+            gen = FakerDataGenerator(seed=42)
+            path_a = _write_input_csv(
+                gen.generate_company_list(n_faker_a, "de", id_prefix="src-a"),
+                "source_a",
+            )
+            st.session_state.temp_a_path      = path_a
+            st.session_state.faker_a_generated = True
+            st.success(f"Generated {n_faker_a} Source A entries → `{Path(path_a).name}`")
+
+        if source_a_file is not None:
+            _cleanup_temp(st.session_state.temp_a_path)
+            st.session_state.temp_a_path       = _save_upload_to_temp(source_a_file, "upload_a_")
+            st.session_state.faker_a_generated = False
+
+        if st.session_state.temp_a_path:
+            tag = " (Faker)" if st.session_state.faker_a_generated else " (uploaded)"
+            st.caption(f"`{Path(st.session_state.temp_a_path).name}`{tag}")
+
     with col_b:
-        source_b_file = st.file_uploader("Source B (Core Banking)", type=["csv", "json"])
+        source_b_file = st.file_uploader("Source B", type=["csv", "json"])
+        n_faker_b = st.number_input(
+            "Faker entries", min_value=10, max_value=500, value=50, step=10,
+            key="n_faker_b",
+        )
+        faker_b_button = st.button("Generate Faker B", key="btn_faker_b", use_container_width=True)
 
-    col_n, col_fbtn, _ = st.columns([1, 2, 4])
-    with col_n:
-        n_faker = st.number_input("Faker N (each)", min_value=10, max_value=500, value=50, step=10)
-    with col_fbtn:
-        st.markdown(" ")
-        faker_button = st.button("Generate Faker Data", use_container_width=True)
+        if faker_b_button:
+            gen = FakerDataGenerator(seed=42)
+            path_b = _write_input_csv(
+                gen.generate_company_list(n_faker_b, "de", id_prefix="src-b"),
+                "source_b",
+            )
+            st.session_state.temp_b_path      = path_b
+            st.session_state.faker_b_generated = True
+            st.success(f"Generated {n_faker_b} Source B entries → `{Path(path_b).name}`")
 
-    if faker_button:
-        _cleanup_temp(st.session_state.temp_a_path)
-        _cleanup_temp(st.session_state.temp_b_path)
-        gen = FakerDataGenerator(seed=42)
-        st.session_state.temp_a_path     = _write_temp_csv(gen.generate_company_list(n_faker, "de"), "faker_a_")
-        st.session_state.temp_b_path     = _write_temp_csv(gen.generate_company_list(n_faker, "de"), "faker_b_")
-        st.session_state.faker_generated = True
-        st.success(f"Generated {n_faker} Source A + {n_faker} Source B Faker entries.")
+        if source_b_file is not None:
+            _cleanup_temp(st.session_state.temp_b_path)
+            st.session_state.temp_b_path       = _save_upload_to_temp(source_b_file, "upload_b_")
+            st.session_state.faker_b_generated = False
 
-    if source_a_file is not None:
-        _cleanup_temp(st.session_state.temp_a_path)
-        st.session_state.temp_a_path     = _save_upload_to_temp(source_a_file, "upload_a_")
-        st.session_state.faker_generated = False
-    if source_b_file is not None:
-        _cleanup_temp(st.session_state.temp_b_path)
-        st.session_state.temp_b_path     = _save_upload_to_temp(source_b_file, "upload_b_")
-        st.session_state.faker_generated = False
+        if st.session_state.temp_b_path:
+            tag = " (Faker)" if st.session_state.faker_b_generated else " (uploaded)"
+            st.caption(f"`{Path(st.session_state.temp_b_path).name}`{tag}")
 
     active_a = st.session_state.temp_a_path
     active_b = st.session_state.temp_b_path
-
-    if active_a:
-        tag = " (Faker)" if st.session_state.faker_generated and source_a_file is None else " (uploaded)"
-        st.caption(f"Source A: `{Path(active_a).name}`{tag}")
-    if active_b:
-        tag = " (Faker)" if st.session_state.faker_generated and source_b_file is None else " (uploaded)"
-        st.caption(f"Source B: `{Path(active_b).name}`{tag}")
 
     st.divider()
 

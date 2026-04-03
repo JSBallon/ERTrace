@@ -134,7 +134,12 @@ class FakerDataGenerator:
     # Public API
     # ------------------------------------------------------------------
 
-    def generate_company_list(self, n: int, language: str = "de") -> list[dict]:
+    def generate_company_list(
+        self,
+        n: int,
+        language: str = "de",
+        id_prefix: str = "src",
+    ) -> list[dict]:
         """
         Generate n synthetic company records.
 
@@ -143,8 +148,11 @@ class FakerDataGenerator:
         Legal forms are randomly assigned from the DE or EN pool.
 
         Args:
-            n: Number of records to generate.
-            language: "de" (German base pool) or "en" (English base pool).
+            n:         Number of records to generate.
+            language:  "de" (German base pool) or "en" (English base pool).
+            id_prefix: Prefix for source_id values (e.g. "src-a", "src-b").
+                       Defaults to "src". Callers should pass a meaningful prefix
+                       that reflects the role of the data, not the language.
 
         Returns:
             List of dicts with keys: source_id, source_name.
@@ -158,7 +166,7 @@ class FakerDataGenerator:
             name = self._maybe_add_noise(name, rate=0.20)
             name = self._maybe_add_typo(name, rate=0.10)
             records.append({
-                "source_id": f"{'crm' if language == 'de' else 'src'}_{i+1:04d}",
+                "source_id": f"{id_prefix}_{i+1:04d}",
                 "source_name": name,
             })
 
