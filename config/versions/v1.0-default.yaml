@@ -20,14 +20,14 @@ faiss:
   top_k: 5
 
 thresholds:
-  auto_match_threshold: 0.92
-  review_lower_threshold: 0.70
+  auto_match_threshold: 0.90
+  review_lower_threshold: 0.80
 
 weights:
-  w_embedding: 0.50
+  w_embedding: 0.15
   w_jaro_winkler: 0.20
-  w_token_sort: 0.20
-  w_legal_form: 0.10
+  w_token_sort: 0.50
+  w_legal_form: 0.15
   # Constraint: sum must equal 1.0
 
 legal_form:

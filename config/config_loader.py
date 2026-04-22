@@ -3,10 +3,10 @@ Config — config_loader
 
 Loads the active versioned YAML configuration and constructs a fully validated RunConfig.
 
-Two-file resolution (see ADR-M2-006):
+Two-file resolution:
   1. config/config.yaml          → reads active_version + config_path
   2. config/versions/<ver>.yaml  → reads all parameters (embedding, faiss, thresholds,
-                                    weights, legal_form, monitoring)
+                                     weights, legal_form, monitoring)
 
 Constructs RunConfig (Pydantic) — the only input ERTracePipeline needs.
 All YAML parsing is isolated here. ERTracePipeline never touches the filesystem.

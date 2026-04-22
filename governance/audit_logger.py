@@ -83,6 +83,7 @@ class AuditLogger:
         config: RunConfig,
         input_file_a: str = "",
         input_file_b: str = "",
+        config_adjustments: dict | None = None,
     ) -> None:
         """
         Log the start of a pipeline run with the full configuration.
@@ -95,17 +96,25 @@ class AuditLogger:
         They are validated by InputLoader before being recorded here — ensuring
         the audit record only captures paths confirmed to exist.
 
+        config_adjustments (ADR-M3-006): optional diff provided when the Streamlit UI
+        overrides YAML defaults. Format: {field: {"from": old_val, "to": new_val}}.
+        Only included in the event when non-empty. Default callers (CLI, tests) pass None.
+
         Args:
-            config:       Full RunConfig — all algorithm parameters captured verbatim.
-            input_file_a: Validated path to Source A input file (CRM).
-            input_file_b: Validated path to Source B input file (Core Banking).
+            config:             Full RunConfig — all algorithm parameters captured verbatim.
+            input_file_a:       Validated path to Source A input file (CRM).
+            input_file_b:       Validated path to Source B input file (Core Banking).
+            config_adjustments: Optional diff of UI-adjusted params vs. YAML defaults.
         """
-        self._write({
+        event: dict = {
             "event_type": "run_start",
             **config.model_dump(),
             "input_file_a": input_file_a,
             "input_file_b": input_file_b,
-        })
+        }
+        if config_adjustments:
+            event["config_adjustments"] = config_adjustments
+        self._write(event)
 
     def log_match_result(self, result: MatchResult) -> None:
         """
