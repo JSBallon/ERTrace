@@ -1,8 +1,8 @@
 # ERTrace — Entity Resolution Tracer
 ### Audit-native entity resolution for agentic AI in regulated financial institutions
 
-> **Version:** v0.1.0-alpha
-> **Status:** Work in Progress — core pipeline functional; Streamlit/CLI placeholder
+> **Version:** v0.1.1-alpha
+> **Status:** M3 complete — core pipeline, Streamlit GUI, and CLI all functional
 > **License:** Apache 2.0
 > **Stack:** Python 3.12 · sentence-transformers · FAISS · rapidfuzz · Pydantic v2
 
@@ -125,7 +125,7 @@ Priority 1 cases (high composite score despite legal form conflict) flag front-o
 
 ---
 
-## Current State (v0.1.0-alpha)
+## Current State (v0.1.1-alpha)
 
 This is a work-in-progress demo release. The core pipeline is fully implemented and functional. The user-facing interface layer is not yet complete.
 
@@ -139,12 +139,10 @@ This is a work-in-progress demo release. The core pipeline is fully implemented 
 | Output: nested JSON (`entry / match / rerank`), datetime-prefixed filenames | ✅ Complete |
 | `run_manual_test.py` — E2E demo runner (Faker data, German banking names) | ✅ Complete |
 | Unit tests: normaliser, legal form extractor, embedder, FAISS, fuzzy, composite, router, output writer, audit logger | ✅ Complete |
-| `gui/streamlit_app.py` — Streamlit pipeline controller | ❌ Placeholder |
-| `gui/cli.py` — CLI entry point | ❌ Placeholder |
+| `gui/streamlit_app.py` — Streamlit pipeline controller | ✅ Complete |
+| `gui/cli.py` — CLI entry point | ✅ Complete |
 | E2E integration tests | ❌ Not written |
 | Scoring improvement prototypes (last-token cosine, acronym expansion) | ❌ Planned (M4) |
-
-The working demo entry point is `run_manual_test.py`.
 
 ---
 
@@ -164,19 +162,27 @@ pip install -r requirements.txt
 # 2. Download embedding model (once — cached locally afterwards)
 python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('Vsevolod/company-names-similarity-sentence-transformer')"
 
-# 3. Run the demo
-python run_manual_test.py
+# 3. Run the app
+
+# Option A — Streamlit GUI (recommended)
+python -m streamlit run gui/streamlit_app.py
+
+# Option B — CLI with your own CSV files
+python -m gui.cli --source-a inputs/source_a.csv --source-b inputs/source_b.csv
+
+# Option C — CLI with auto-generated Faker data (no input files needed)
+python -m gui.cli --generate
 ```
 
 No API keys required. No external calls during pipeline execution. Set `TRANSFORMERS_OFFLINE=1` to enforce offline mode after the initial model download.
 
-The demo generates 20 CRM entries (Source A) and 30 core banking entries (Source B) using German banking names via Faker, runs the full pipeline, and writes three output files to `outputs/`:
+**Option A** opens the Streamlit pipeline controller in your browser. Upload Source A and Source B CSVs (or generate Faker data in-app), adjust model/threshold/weight parameters via sliders, and download the three output files when the run completes.
+
+**Option B / C** run the pipeline from the terminal and print a summary to stdout. All three output files are written to `outputs/`:
 
 - `output_<datetime>_<run_id>.json` — all results, nested `entry / match / rerank` structure
 - `review_<datetime>_<run_id>.json` — REVIEW entries only, sorted by priority (P1 first)
 - `audit_<datetime>_<run_id>.jsonl` — append-only audit trail
-
-Drag `output_*.json` into any JSON viewer to inspect the score vectors and rerank candidates.
 
 ---
 
@@ -207,7 +213,7 @@ PoC2_TGFR-Entity-Resolution/
 │   ├── sanitizer.py
 │   └── output_writer.py          # Nested JSON serialization
 ├── bll/                          # Business Logic Layer — TGFR matching engine
-│   ├── ertrace_pipeline.py       # ERTracePipeline — pure BLL engine, no I/O
+│   ├── pipeline.py               # ERTracePipeline — pure BLL engine, no I/O
 │   ├── app_service.py            # run_entity_resolution() — cross-layer entry point
 │   ├── router.py                 # Routing + 2D priority matrix + FR-LF-05 guardrail
 │   ├── embedder.py
@@ -219,11 +225,11 @@ PoC2_TGFR-Entity-Resolution/
 ├── governance/
 │   └── audit_logger.py           # JSONL append-only audit log
 ├── gui/
-│   ├── streamlit_app.py          # ⚠ Placeholder — not yet implemented
-│   └── cli.py                    # ⚠ Placeholder — not yet implemented
+│   ├── streamlit_app.py          # Streamlit pipeline controller
+│   └── cli.py                    # CLI entry point (4 run modes)
 ├── tests/                        # Unit + scoring validation tests
 ├── .docs/                        # Architecture and governance documentation
-├── run_manual_test.py            # ← Working demo entry point (v0.1.0-alpha)
+├── run_manual_test.py            # Minimal E2E smoke runner (Faker data)
 ├── logs/audit/                   # JSONL audit logs (gitignored)
 └── outputs/                      # Pipeline outputs (gitignored)
 ```
@@ -234,9 +240,9 @@ PoC2_TGFR-Entity-Resolution/
 
 | Stage | Description |
 |---|---|
-| **v0.1.0-alpha** (this) | Core TGFR pipeline, full audit trail, `run_manual_test.py` entry point |
-| **v0.1 — M3 complete** | Streamlit pipeline controller, CLI entry point, E2E integration tests |
-| **v0.2 — M4** | Scoring improvements (last-token cosine, acronym expansion), reproducibility tests |
+| **v0.1.0-alpha** | Core TGFR pipeline, full audit trail |
+| **v0.1.1-alpha** (this) | Streamlit pipeline controller, CLI entry point (M3 complete) |
+| **v0.2 — M4** | Scoring improvements (last-token cosine, acronym expansion), reproducibility tests, E2E integration tests |
 | **PoC_3** | LangGraph self-correcting agent for REVIEW list, full HITL approval gate |
 | **PoC_4** | Web search + MCP connectors for reference databases (LEI/GLEIF) |
 | **Production path** | Qdrant persistent index, Splink probabilistic linking, PII governance wrapper |
